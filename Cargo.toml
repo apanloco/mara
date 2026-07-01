@@ -1,34 +1,66 @@
 [workspace]
-members = ["crates/core", "crates/solver", "crates/api"]
+members = ["cli"]
+# So `cargo run --release -- …` from the repo root launches the CLI without `-p mara-cli`.
+# Publishing is unaffected (`cargo publish -p mara` targets the library explicitly). Note this
+# also narrows bare `cargo test`/`cargo build` to the CLI package — use `--workspace` to cover
+# the library's tests.
+default-members = ["cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Daniel Åkerud <daniel.akerud@fossid.com>"]
+repository = "https://github.com/apanloco/mara"
 
 [profile.dev.package."*"]
 opt-level = 3
 
 [package]
-name = "mara-cli"
-version = "0.1.0"
-edition = "2024"
-default-run = "mara"
-
-[[bin]]
 name = "mara"
-path = "src/main.rs"
+description = "A high-performance scraper that clears challenges over a rotating pool of egress IPs."
+readme = "README.md"
+homepage = "https://github.com/apanloco/mara"
+documentation = "https://docs.rs/mara"
+keywords = ["scraper", "scraping", "proxy", "browser"]
+categories = ["web-programming", "web-programming::http-client"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+# Keep the published tarball small and library-only: fixtures, dev docs, and CI/tooling config
+# live in the repo but don't belong in the crate.
+exclude = ["/test_data", "/ui.png", "/*.log", "/CLAUDE.md", "/docs", "/.github", "/cli"]
 
 [dependencies]
-mara = { path = "crates/api", features = ["mullvad"] }
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+async-channel = "2"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+chromiumoxide = "0.9"
 futures = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "signal"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "fs", "sync", "net"] }
+tracing = "0.1"
+url = "2"
+wreq = { version = "=6.0.0-rc.29", default-features = false, features = ["tokio-rt", "webpki-roots", "json", "socks", "cookies", "gzip", "brotli", "deflate"] }
+wreq-util = { version = "=3.0.0-rc.12", default-features = false, features = ["emulation"] }
+x11rb = { version = "0.13", features = ["xfixes", "xtest"] }
 
 [dev-dependencies]
-serde_json = "1"
-serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Used by examples/scrape_fragrantica.
 scraper = "0.24"
-url = "2"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 md-5 = "0.10"
-base64 = "0.22"
 hex = "0.4"

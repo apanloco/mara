@@ -1427,16 +1427,19 @@ checksum = "c41e0c4fef86961ac6d6f8a82609f55f31b05e4fce149ac5710e439df7619ba4"
 name = "mara"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "async-channel",
  "axum",
  "base64",
+ "cbc",
  "chromiumoxide",
  "futures",
+ "hex",
  "image",
- "mara-core",
- "mara-solver",
+ "md-5",
  "reqwest 0.12.28",
+ "scraper",
  "serde",
  "serde_json",
  "tempfile",
@@ -1454,45 +1457,12 @@ dependencies = [
 name = "mara-cli"
 version = "0.1.0"
 dependencies = [
- "aes",
  "anyhow",
- "base64",
- "cbc",
  "clap",
  "futures",
- "hex",
  "mara",
- "md-5",
- "scraper",
- "serde",
- "serde_json",
  "tokio",
  "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "mara-core"
-version = "0.1.0"
-dependencies = [
- "serde",
- "url",
-]
-
-[[package]]
-name = "mara-solver"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chromiumoxide",
- "futures",
- "image",
- "mara-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "x11rb",
 ]
 
 [[package]]

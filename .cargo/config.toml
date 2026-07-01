@@ -1,2 +1,0 @@
-[alias]
-test-live = "test -p mara --test live --features mullvad -- --ignored --nocapture"
