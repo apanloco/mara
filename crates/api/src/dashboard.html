@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mara · introspect</title>
+<style>
+  :root {
+    --bg: #0a0d13; --panel: #11151f; --line: #1d2433; --muted: #7c8798;
+    --fg: #eef2f8; --accent: #ff7a18;
+    --in: #c8a2ff;
+    --zebra: rgba(255,255,255,.018); --hover: rgba(255,255,255,.04);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  #top { display: flex; align-items: center; border-bottom: 1px solid var(--line); flex: none; }
+  #brand {
+    padding: 10px 16px; border-right: 1px solid var(--line); align-self: stretch;
+    display: flex; align-items: center; gap: 8px;
+  }
+  #brand b { font-size: 15px; letter-spacing: .5px; }
+  #brand b span { color: var(--accent); }
+  #brand small { color: var(--muted); }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: #2ecc71; box-shadow: 0 0 8px #2ecc71; }
+  #dot.off { background: #555; box-shadow: none; }
+  #counts { display: flex; gap: 20px; padding: 0 16px; color: var(--muted); border-right: 1px solid var(--line); align-self: stretch; align-items: center; }
+  #counts b { color: var(--fg); font-weight: 700; font-variant-numeric: tabular-nums; }
+
+  /* ---- state census: a live per-state head-count that sums to the catalog ---- */
+  #census { display: flex; flex-wrap: wrap; gap: 7px; padding: 8px 16px; align-items: center; min-width: 0; }
+  #census .pill {
+    display: inline-flex; align-items: baseline; gap: 5px;
+    font-size: 11px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase;
+    padding: 2px 9px; border-radius: 999px; animation: none;
+  }
+  #census .pill .n { font-size: 12px; font-variant-numeric: tabular-nums; }
+  #census .pill.zero { opacity: .32; }
+
+  /* ---- job-progress: the fetch_all batch's live counter (driver-owned) ---- */
+  #jobprog { display: flex; align-items: center; gap: 14px; padding: 7px 16px; border-bottom: 1px solid var(--line);
+    background: var(--panel); font-size: 12px; flex: none; }
+  #jobprog[hidden] { display: none; }
+  #jp-text { color: var(--fg); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #jp-text b { color: var(--accent); font-weight: 700; }
+  #jp-text .sep { color: var(--muted); margin: 0 4px; }
+  #jp-text .dim { color: var(--muted); }
+  #jp-text .err { color: #ff6b6b; font-weight: 700; }
+  #jp-bar { flex: 1; min-width: 60px; height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+  #jp-bar[hidden] { display: none; }
+  /* linear + matched to the ~publish cadence so the bar glides at constant velocity between the
+     discrete progress updates instead of re-easing (and stuttering) on each one. */
+  #jp-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width .12s linear; }
+
+  /* ---- carousels (live thumbnails + failed-run ghosts) ---- */
+  .carousel { flex: none; border-bottom: 1px solid var(--line); }
+  .carhead {
+    display: flex; align-items: center; gap: 9px; padding: 8px 14px; cursor: pointer;
+    color: var(--muted); user-select: none; letter-spacing: .3px;
+  }
+  .carhead:hover { color: var(--fg); }
+  .carhead b { color: var(--fg); font-weight: 700; font-variant-numeric: tabular-nums; }
+  .carhead .cartoggle { display: inline-block; width: 10px; color: var(--muted); transition: transform .12s; }
+  .carhead .hint { margin-left: auto; color: var(--muted); font-size: 11px; }
+  .carousel.collapsed .cartoggle { transform: rotate(-90deg); }
+  .carousel.collapsed .carbody { display: none; }
+  .carbody { max-height: 40vh; overflow-y: auto; padding: 0 10px 10px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 10px; }
+  .empty { color: var(--muted); padding: 8px 4px; }
+  .thumb {
+    width: 240px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    overflow: hidden; cursor: pointer; transition: border-color .15s;
+  }
+  .thumb:hover { border-color: var(--accent); }
+  .thumb.ghost { border-color: #4a2230; }
+  .thumb.ghost:hover { border-color: #ff6b81; }
+  .thumb.ghost .shot { opacity: .85; }
+  .thead .x { flex: none; color: var(--muted); cursor: pointer; padding: 0 2px; }
+  .thead .x:hover { color: #ff6b81; }
+  .thead { display: flex; align-items: center; gap: 8px; padding: 7px 9px; }
+  .thead .code { color: var(--accent); font-weight: 700; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .thead .badge { flex: none; }
+  .tfoot { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 9px; color: var(--muted); border-top: 1px solid var(--line); font-size: 11px; }
+  .tfoot .elapsed { font-variant-numeric: tabular-nums; }
+  .shot {
+    display: block; width: 100%; aspect-ratio: 1366 / 768; object-fit: cover; object-position: top center;
+    background: repeating-conic-gradient(#0c1018 0% 25%, #0a0d13 0% 50%) 50% / 18px 18px;
+    border-top: 1px solid var(--line);
+  }
+  .shot.blank { opacity: .25; }
+
+  .badge {
+    font-size: 11px; font-weight: 700; letter-spacing: .4px;
+    padding: 2px 8px; border-radius: 999px; text-transform: uppercase;
+  }
+  .p-idle       { background:#222a38; color:#8a97ad; }
+  .p-navigating { background:#173a52; color:#5bc0ff; }
+  .p-challenge  { background:#4a2f10; color:#ffb454; }
+  .p-verifying  { background:#3a2a55; color:#c8a2ff; animation: pulse 1s infinite; }
+  .p-cleared    { background:#11401f; color:#39d353; }
+  .p-blocked    { background:#4a1620; color:#ff6b81; }
+  .p-failed     { background:#3a1414; color:#ff5252; }
+  @keyframes pulse { 50% { opacity: .55; } }
+
+  /* ---- exits table (fills the rest) ---- */
+  #exits { flex: 1; overflow: auto; min-height: 0; }
+  #exits-empty { color: var(--muted); padding: 24px 18px; }
+  table.exits { width: 100%; border-collapse: collapse; }
+  table.exits th, table.exits td { text-align: left; padding: 8px 14px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  table.exits th {
+    color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--bg); z-index: 1; cursor: help;
+    text-transform: uppercase; letter-spacing: .5px; font-size: 11px; box-shadow: 0 1px 0 var(--line);
+  }
+  table.exits th.num, table.exits td.num { text-align: right; }
+  table.exits td.num { font-variant-numeric: tabular-nums; }
+  /* zebra lives on the row so a state-highlighted td (set below) paints over it */
+  table.exits tbody tr:nth-child(even) { background: var(--zebra); }
+  table.exits tbody tr:hover td { background: var(--hover); }
+  table.exits td.zero { color: #39414f; }
+  table.exits td.bad  { color: #ff8a8a; }
+  table.exits td.warn { color: #ffb454; }
+  table.exits tr.serving td, table.exits tr.solving td { background: #1a1430; }
+  table.exits tr.serving td:first-child, table.exits tr.solving td:first-child { box-shadow: inset 3px 0 0 var(--in); }
+  table.exits tr.ready td:first-child, table.exits tr.warm td:first-child { box-shadow: inset 3px 0 0 #2a6b3a; }
+  table.exits tr.cooldown td:first-child, table.exits tr.rate-limited td:first-child { box-shadow: inset 3px 0 0 #6b561f; }
+  table.exits tr.blocked td:first-child, table.exits tr.wonky td:first-child { box-shadow: inset 3px 0 0 #6b2230; }
+  button.copy {
+    background: none; border: 1px solid var(--line); color: var(--muted); cursor: pointer;
+    border-radius: 5px; padding: 1px 7px; font: inherit; font-size: 12px;
+    box-sizing: border-box; min-width: 88px; text-align: center; white-space: nowrap;
+  }
+  button.copy:hover { color: var(--fg); border-color: var(--accent); }
+  .s-probing  { background:#173a52; color:#5bc0ff; }
+  .s-ready    { background:#11401f; color:#39d353; }
+  .s-serving  { background:#3a2a55; color:#c8a2ff; animation: pulse 1.4s infinite; }
+  .s-solving  { background:#3a2a55; color:#c8a2ff; animation: pulse 1.4s infinite; }
+  .s-warm     { background:#13302a; color:#5fd0a8; }
+  .s-idle     { background:#11401f; color:#39d353; }
+  .s-paced    { background:#123038; color:#7fd6e0; }
+  .s-slow     { background:#2b3850; color:#a9bbd6; }
+  .s-wonky    { background:#4a1620; color:#ff6b81; }
+  .s-blocked  { background:#4a1620; color:#ff6b81; }
+  .s-cooldown, .s-rate-limited { background:#4a2f10; color:#ffb454; }
+
+  /* ---- enlarge overlay ---- */
+  #overlay { position: fixed; inset: 0; background: rgba(4,6,10,.88); z-index: 50; display: grid; place-items: center; padding: 24px; }
+  #overlay[hidden] { display: none; }
+  /* Fixed-height column: the frame flexes into whatever the bar/summary leave and uses
+     object-fit:contain, so it scales to fit and never clips its bottom. */
+  #overlay-card { display: flex; flex-direction: column; gap: 10px; width: 94vw; height: 92vh; }
+  #overlay-bar { flex: none; display: flex; gap: 18px; align-items: center; color: var(--muted); }
+  #overlay-bar .v { color: var(--fg); font-weight: 700; }
+  #overlay-bar .x { margin-left: auto; cursor: pointer; border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; color: var(--muted); }
+  #overlay-bar .x:hover { color: var(--fg); border-color: var(--accent); }
+  #ov-failinfo { flex: none; display: flex; gap: 22px; align-items: baseline; color: var(--muted); }
+  #ov-failinfo[hidden] { display: none; }
+  #ov-failinfo b { color: var(--fg); font-weight: 700; }
+  #ov-failinfo .title { color: var(--accent); font-weight: 700; font-size: 15px; }
+  #ov-failinfo .title.empty { color: #ff8a8a; font-style: italic; }
+  #overlay-frame {
+    flex: 1 1 auto; min-height: 0; width: 100%; object-fit: contain; object-position: center;
+    border-radius: 8px; border: 1px solid var(--line);
+    box-shadow: 0 12px 60px rgba(0,0,0,.7);
+    background: repeating-conic-gradient(#0c1018 0% 25%, #0a0d13 0% 50%) 50% / 22px 22px;
+  }
+  #ov-summary {
+    flex: none; margin: 0; max-height: 22vh; overflow: auto;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; color: var(--muted); white-space: pre-wrap; word-break: break-all;
+    font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace;
+  }
+</style>
+</head>
+<body>
+  <header id="top">
+    <div id="brand"><b>mara<span>·</span></b><small>introspect</small><div id="dot" class="off"></div></div>
+    <div id="counts">
+      <span>browsers <b id="browsers-count">0</b></span>
+      <span>exits <b id="exits-count">—</b></span>
+      <span title="exits holding a usable clearance — the warm-store size, however many are servable right now">cleared <b id="cleared-count">—</b></span>
+    </div>
+    <div id="census"></div>
+  </header>
+
+  <div id="jobprog" hidden>
+    <span id="jp-text"></span>
+    <div id="jp-bar"><div id="jp-fill"></div></div>
+  </div>
+
+  <section id="live" class="carousel">
+    <div class="carhead" data-target="live"><span class="cartoggle">▾</span><span>browsers · live</span><b id="live-count">0</b></div>
+    <div class="carbody">
+      <div id="grid" class="grid"></div>
+      <div id="browsers-empty" class="empty">no browsers working</div>
+    </div>
+  </section>
+
+  <section id="failed" class="carousel collapsed">
+    <div class="carhead" data-target="failed"><span class="cartoggle">▾</span><span>browsers · failed</span><b id="ghosts-count">0</b><span class="hint">click a card to inspect · ✕ to dismiss</span></div>
+    <div class="carbody">
+      <div id="ghost-grid" class="grid"></div>
+      <div id="ghosts-empty" class="empty">no failed runs</div>
+    </div>
+  </section>
+
+  <section id="exits">
+    <div id="exits-empty">no exit pool active</div>
+    <table class="exits" id="exits-table" hidden>
+      <thead><tr>
+        <th title="Mullvad relay code">code</th>
+        <th title="country">country</th>
+        <th title="pool status: probing / ready / in use / cooldown / wonky">status</th>
+        <th class="num" title="am.i.mullvad health-probe round-trip latency (double hop)">lat</th>
+        <th class="num" title="avg browser-free request round-trip (EWMA) — the real per-fetch time that paces throughput; last in the tooltip">rt</th>
+        <th class="num" title="total slim requests sent through this exit">req</th>
+        <th class="num" title="browser-free successes (slim reached the origin)">ok</th>
+        <th class="num" title="headed solves performed on this exit">solv</th>
+        <th class="num" title="1015 rate-limits hit">1015</th>
+        <th class="num" title="1020 hard WAF blocks (IP burned)">1020</th>
+        <th class="num" title="slim transport timeouts (no response)">t/o</th>
+        <th class="num" title="knee estimate: requests served on the clearance window at the last 1015">knee</th>
+        <th class="num" title="time since the last browser-free success">last ok</th>
+        <th class="num" title="age of the last health probe">probed</th>
+        <th>proxy</th>
+      </tr></thead>
+      <tbody id="exits-body"></tbody>
+    </table>
+  </section>
+
+  <div id="overlay" hidden>
+    <div id="overlay-card">
+      <div id="overlay-bar">
+        <span>watching <span class="v" id="ov-sel">—</span></span>
+        <span>exit <span class="v" id="ov-exit">—</span></span>
+        <span>phase <span class="v" id="ov-phase">—</span></span>
+        <span>clicks <span class="v" id="ov-clicks">—</span></span>
+        <span>elapsed <span class="v" id="ov-elapsed">—</span></span>
+        <span>latency <span class="v" id="ov-latency">—</span></span>
+        <span>last click <span class="v" id="ov-click">—</span></span>
+        <span class="x" id="ov-close">✕ close (esc)</span>
+      </div>
+      <div id="ov-failinfo" hidden>
+        <span>reason <b id="ov-reason">—</b></span>
+        <span>final title <span class="title" id="ov-title">—</span></span>
+      </div>
+      <img id="overlay-frame">
+      <pre id="ov-summary" hidden></pre>
+    </div>
+  </div>
+
+<script>
+const browsers = new Map();
+const ghosts = new Map();          // failed-run id -> ghost {id, exit, clicks, elapsed_ms, latency_ms, summary, shot}
+// Exit state arrives as per-exit DELTAS, keyed by `code`. `exitData` is the current row data
+// (facets ∪ stats, one ExitRow); `exitDirty`/`exitResort`/`exitRebuild` drive surgical rendering
+// so a delta repaints one <tr>, not the whole 533-row table.
+const exitData = new Map();        // code -> ExitRow
+let exitDirty = new Set();         // codes changed since the last render
+let exitResort = false;            // a badge changed / rows added → re-sort the table
+let exitRebuild = false;           // init / re-seed → rebuild every row from scratch
+let jobProgress = null;            // fetch_all batch counter {total, done, ok, err, in_flight, per_sec, eta_secs}
+let selected = null;               // live browser id shown in the overlay
+let selectedGhost = null;          // ghost id shown in the overlay (mutually exclusive with `selected`)
+let ws;
+const frameUrls = new Map();      // browser id -> current object URL
+const browserCards = new Map();   // browser id -> { el, img, badge, code, elapsed }
+const ghostCards = new Map();     // ghost id -> { el, img, code, elapsed }
+
+const $ = (id) => document.getElementById(id);
+const fmtMs = (ms) => ms >= 1000 ? (ms/1000).toFixed(1)+"s" : ms+"ms";
+const fmtAge = (s) => s == null ? "—" : s < 60 ? s+"s ago" : Math.floor(s/60)+"m ago";
+const ageOf = (unix) => unix == null ? null : Math.max(0, Math.round(Date.now()/1000 - unix));
+
+// The ghost summary is `key: value` lines (reason/url/title/html_bytes/…); parse it so the
+// zoom can surface the title it ended on (and why it gave up) without digging through the blob.
+function parseSummary(s) {
+  const o = {};
+  (s || "").split("\n").forEach(line => {
+    const i = line.indexOf(": ");
+    if (i > 0) o[line.slice(0, i).trim()] = line.slice(i + 2);
+  });
+  return o;
+}
+
+// Replace the whole exit set (init / re-seed after a lag) and flag a full table rebuild.
+function seedExits(rows) {
+  exitData.clear();
+  (rows || []).forEach(r => exitData.set(r.code, r));
+  exitRebuild = true;
+}
+
+const labelOf = (key) => {
+  if (!key) return "direct";
+  return key.replace(/^socks5h?:\/\//, "").split(".")[0];
+};
+
+function copyProxy(url, btn) {
+  const flash = () => { const t = btn.textContent; btn.textContent = "✓ copied"; setTimeout(() => { btn.textContent = t; }, 900); };
+  if (navigator.clipboard) navigator.clipboard.writeText(url).then(flash, () => fallbackCopy(url, flash));
+  else fallbackCopy(url, flash);
+}
+function fallbackCopy(text, done) {
+  const ta = document.createElement("textarea");
+  ta.value = text; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); done(); } catch (_) {}
+  document.body.removeChild(ta);
+}
+
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";   // need the 4-byte browser-id header on each frame
+  ws.onopen  = () => {
+    $("dot").classList.remove("off");
+    if (selected !== null) ws.send(JSON.stringify({ select: selected }));
+  };
+  ws.onclose = () => { $("dot").classList.add("off"); setTimeout(connect, 250); };
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") { onFrame(ev.data); return; }
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "init") {
+      browsers.clear(); msg.browsers.forEach(b => browsers.set(b.id, b));
+      ghosts.clear(); (msg.ghosts || []).forEach(g => ghosts.set(g.id, g));
+      seedExits(msg.exits);
+      jobProgress = msg.progress || null;
+    }
+    else if (msg.type === "progress") { jobProgress = msg.progress; }
+    else if (msg.type === "ghost") { ghosts.set(msg.ghost.id, msg.ghost); browsers.delete(msg.ghost.id); }
+    else if (msg.type === "ghost_retired") { ghosts.delete(msg.id); if (selectedGhost === msg.id) closeOverlay(); }
+    else if (msg.type === "update") {
+      if (msg.browser.retired) {
+        browsers.delete(msg.browser.id);
+        if (selected === msg.browser.id) closeOverlay();
+      } else {
+        browsers.set(msg.browser.id, msg.browser);
+      }
+    }
+    // One exit changed: patch just its row.
+    else if (msg.type === "exit") { exitData.set(msg.row.code, msg.row); exitDirty.add(msg.row.code); }
+    // Lost some deltas (lagged): re-seed the full set.
+    else if (msg.type === "exits_full") { seedExits(msg.exits); }
+    scheduleRender();
+  };
+}
+
+// A binary frame is [4-byte big-endian browser id][PNG]. Route it to that browser's
+// thumbnail, and to the overlay if it's the one being enlarged.
+function onFrame(buf) {
+  const id = new DataView(buf).getUint32(0, false);
+  const url = URL.createObjectURL(new Blob([new Uint8Array(buf, 4)], { type: "image/png" }));
+  const prev = frameUrls.get(id);
+  frameUrls.set(id, url);
+  const card = browserCards.get(id);
+  if (card) { card.img.src = url; card.img.classList.remove("blank"); }
+  if (selected === id) $("overlay-frame").src = url;
+  if (prev) URL.revokeObjectURL(prev);
+}
+
+let renderQueued = false;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => { renderQueued = false; render(); });
+}
+
+function openOverlay(id) {
+  selected = id;
+  selectedGhost = null;
+  $("ov-summary").hidden = true;
+  $("ov-failinfo").hidden = true;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ select: id }));
+  $("overlay").hidden = false;
+  const u = frameUrls.get(id);
+  $("overlay-frame").src = u || "";
+  updateOverlayBar();
+}
+
+// A ghost is a frozen record: show its stored frame + summary, and stop any live frame stream.
+function openGhost(id) {
+  const g = ghosts.get(id);
+  if (!g) return;
+  selected = null;
+  selectedGhost = id;
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ select: null }));
+  $("overlay").hidden = false;
+  $("overlay-frame").src = g.shot || "";
+  $("ov-sel").textContent = `#${g.id}`;
+  $("ov-exit").textContent = g.exit || "—";
+  $("ov-phase").textContent = "failed";
+  $("ov-clicks").textContent = g.clicks;
+  $("ov-elapsed").textContent = fmtMs(g.elapsed_ms || 0);
+  $("ov-latency").textContent = g.latency_ms != null ? g.latency_ms + "ms" : "n/a";
+  $("ov-click").textContent = "—";
+  const info = parseSummary(g.summary);
+  $("ov-reason").textContent = info.reason || "—";
+  const t = (info.title || "").trim();
+  const titleEl = $("ov-title");
+  titleEl.textContent = t || "(empty — no document.title)";
+  titleEl.classList.toggle("empty", !t);
+  $("ov-failinfo").hidden = false;
+  const pre = $("ov-summary");
+  pre.textContent = g.summary || "";
+  pre.hidden = false;
+}
+
+function dismissGhost(id) {
+  ghosts.delete(id);
+  if (selectedGhost === id) closeOverlay();
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify({ dismiss: id }));
+  scheduleRender();
+}
+
+function closeOverlay() {
+  if (selected !== null && ws && ws.readyState === 1) ws.send(JSON.stringify({ select: null }));
+  selected = null;
+  selectedGhost = null;
+  $("overlay").hidden = true;
+  $("ov-summary").hidden = true;
+  $("ov-failinfo").hidden = true;
+}
+
+function updateOverlayBar() {
+  if (selectedGhost !== null) return;   // the ghost overlay is static — don't clobber it
+  const b = selected !== null ? browsers.get(selected) : null;
+  $("ov-sel").textContent = b ? `#${b.id}` : "—";
+  $("ov-exit").textContent = b && b.exit ? b.exit : "—";
+  $("ov-phase").textContent = b ? b.phase : "—";
+  $("ov-clicks").textContent = b ? b.clicks : "—";
+  $("ov-elapsed").textContent = b ? fmtMs(b.elapsed_ms) : "—";
+  $("ov-latency").textContent = "—"; // live browsers don't carry the exit's probe latency
+  $("ov-click").textContent = b && b.last_click ? `${b.last_click[0]}, ${b.last_click[1]}` : "—";
+}
+
+function makeBrowserCard(id) {
+  const el = document.createElement("div");
+  el.className = "thumb";
+  el.onclick = () => openOverlay(id);
+  el.innerHTML =
+    `<div class="thead"><span class="code"></span><span class="badge ph"></span></div>` +
+    `<img class="shot blank">` +
+    `<div class="tfoot"><span class="id">#${id}</span><span class="elapsed"></span></div>`;
+  return { el, img: el.querySelector(".shot"), badge: el.querySelector(".ph"), code: el.querySelector(".code"), elapsed: el.querySelector(".elapsed") };
+}
+
+function renderBrowsers() {
+  $("browsers-count").textContent = browsers.size;
+  $("live-count").textContent = browsers.size;
+  $("browsers-empty").hidden = browsers.size > 0;
+  const grid = $("grid");
+  const seen = new Set();
+  [...browsers.values()].sort((a, b) => a.id - b.id).forEach(b => {
+    seen.add(b.id);
+    let card = browserCards.get(b.id);
+    if (!card) { card = makeBrowserCard(b.id); browserCards.set(b.id, card); grid.appendChild(card.el); }
+    card.code.textContent = b.exit || "—";
+    card.badge.className = "badge ph p-" + b.phase;
+    card.badge.textContent = b.phase;
+    card.elapsed.textContent = fmtMs(b.elapsed_ms);
+  });
+  for (const [id, card] of browserCards) {
+    if (seen.has(id)) continue;
+    card.el.remove();
+    browserCards.delete(id);
+    const u = frameUrls.get(id);
+    if (u) { URL.revokeObjectURL(u); frameUrls.delete(id); }
+  }
+}
+
+function makeGhostCard(id) {
+  const el = document.createElement("div");
+  el.className = "thumb ghost";
+  el.onclick = () => openGhost(id);
+  el.innerHTML =
+    `<div class="thead"><span class="code"></span><span class="badge p-failed">failed</span><span class="x" title="dismiss">✕</span></div>` +
+    `<img class="shot">` +
+    `<div class="tfoot"><span class="id">#${id}</span><span class="elapsed"></span></div>`;
+  el.querySelector(".x").onclick = (e) => { e.stopPropagation(); dismissGhost(id); };
+  return { el, img: el.querySelector(".shot"), code: el.querySelector(".code"), elapsed: el.querySelector(".elapsed") };
+}
+
+// Compact give-up reason for the card face: "no checkbox (…)" → "no checkbox", "Blocked" → "blocked".
+function shortReason(r) { return (r || "failed").split(" (")[0].toLowerCase(); }
+
+function renderGhosts() {
+  $("ghosts-count").textContent = ghosts.size;
+  $("ghosts-empty").hidden = ghosts.size > 0;
+  const grid = $("ghost-grid");
+  const seen = new Set();
+  [...ghosts.values()].sort((a, b) => b.id - a.id).forEach(g => {   // newest first
+    seen.add(g.id);
+    let card = ghostCards.get(g.id);
+    if (!card) { card = makeGhostCard(g.id); ghostCards.set(g.id, card); }
+    grid.appendChild(card.el);   // re-append keeps the newest-first order
+    card.code.textContent = g.exit || `#${g.id}`;
+    if (card.img.getAttribute("src") !== g.shot) card.img.src = g.shot || "";
+    // The scannable line: probe latency + why it gave up — so a pattern ("all failures >450ms",
+    // "all blocked") jumps out without opening each card.
+    const lat = g.latency_ms != null ? g.latency_ms + "ms" : "n/a";
+    card.elapsed.textContent = `${lat} · ${shortReason(parseSummary(g.summary).reason)}`;
+  });
+  for (const [id, card] of ghostCards) {
+    if (seen.has(id)) continue;
+    card.el.remove();
+    ghostCards.delete(id);
+  }
+}
+
+const exitDom = new Map();   // code -> { tr, cells, badge } (the live <tr> + its last-rendered badge)
+let exitsHover = false;
+
+function cell(tr, cls) {
+  const td = document.createElement("td");
+  if (cls) td.className = cls;
+  tr.appendChild(td);
+  return td;
+}
+
+// Project the three orthogonal facets (activity, warmth + cooling, health — all now on one row)
+// to ONE honest badge: what it's doing now wins, then every reason it can't be leased, then the
+// leasable states. So `warm`/`ready` always mean "servable right now" — a warm-but-still-probing
+// exit reads `probing`, never a misleading `warm`.
+function badgeOf(r) {
+  const act = r.activity || "idle";
+  const health = r.health || "ready";
+  if (act === "solving" || act === "serving") return act;
+  if (r.cooling) return (!r.cooling_reason || r.cooling_reason === "transient") ? "cooldown" : r.cooling_reason;
+  if (health === "wonky") return "wonky";
+  if (r.over_latency) return "slow";        // probed over --max-exit-latency: not leasable
+  if (health === "probing") return "probing";    // not yet probe-confirmed: not leasable, even if cleared
+  if (r.paced) return "paced";                    // healthy, just spacing out under a per-IP rate ceiling
+  return "idle";                                  // leasable, doing nothing — WARMTH is the separate `cleared` axis
+}
+// Warmth (warm/cold) is deliberately NOT a badge: it's orthogonal to what an exit is doing (a
+// serving/paced/cooling exit can be warm or cold), so it lives on its own axis — the header's
+// `cleared N/total` count — not in this activity projection.
+const BADGE_LABEL = { solving: "warming", serving: "serving", "rate-limited": "rate-limited", slow: "too slow", idle: "idle" };
+
+// The single source of truth for badge precedence — used for the census order AND the row sort,
+// so the header, the table, and the badge can never disagree. Least-leasable first; `idle` (free
+// to lease, doing nothing) last.
+const BADGE_ORDER = ["solving", "serving", "blocked", "rate-limited", "cooldown", "wonky", "slow", "probing", "paced", "idle"];
+const BADGE_RANK = Object.fromEntries(BADGE_ORDER.map((b, i) => [b, i]));
+
+// The census strip (the activity axis — one slot per exit, sums to the total). CORE states are
+// always shown (even at zero) so the strip doesn't jump; `paced` is core so the pacing signal is
+// always visible. The rest appear only when an exit is actually in that state.
+const CENSUS_CORE = new Set(["solving", "serving", "paced", "probing", "idle"]);
+const CENSUS_ORDER = BADGE_ORDER;
+
+function renderCensus(counts) {
+  const keys = CENSUS_ORDER.filter(k => CENSUS_CORE.has(k) || counts[k]);
+  for (const k in counts) if (!keys.includes(k)) keys.push(k);   // any unforeseen cooling reason
+  $("census").replaceChildren(...keys.map(k => {
+    const n = counts[k] || 0;
+    const pill = document.createElement("span");
+    pill.className = "pill s-" + k + (n ? "" : " zero");
+    pill.innerHTML = `<span class="n">${n}</span> ${BADGE_LABEL[k] || k}`;
+    return pill;
+  }));
+}
+
+function makeExitRow() {
+  const tr = document.createElement("tr");
+  const code = cell(tr), country = cell(tr), statusTd = cell(tr);
+  const badge = document.createElement("span");
+  statusTd.appendChild(badge);
+  const c = {
+    code, country, badge,
+    lat:   cell(tr, "num"),
+    rt:    cell(tr, "num"),
+    req:   cell(tr, "num"),
+    ok:    cell(tr, "num"),
+    solv:  cell(tr, "num"),
+    rl:    cell(tr, "num"),
+    blk:   cell(tr, "num"),
+    to:    cell(tr, "num"),
+    knee:  cell(tr, "num"),
+    lastok: cell(tr, "num"),
+    probed: cell(tr, "num"),
+  };
+  const btn = document.createElement("button");
+  btn.className = "copy";
+  btn.textContent = "⧉ copy";
+  cell(tr).appendChild(btn);
+  c.copy = btn;
+  return { tr, cells: c };
+}
+
+function setCount(td, n, level) {
+  td.textContent = n == null ? "—" : n;
+  td.className = "num" + (!n ? " zero" : level ? " " + level : "");
+}
+
+function updateExitRow(dom, r, badge) {
+  const c = dom.cells;
+  dom.tr.className = badge;
+  c.code.textContent = !r.code.startsWith("socks5") ? r.code : labelOf(r.proxy_url);
+  c.country.textContent = r.country || "—";
+  c.badge.className = "badge s-" + badge;
+  c.badge.textContent = BADGE_LABEL[badge] || badge;
+  c.lat.textContent = r.latency_ms != null ? r.latency_ms + "ms" : "—";
+  c.rt.textContent = r.avg_latency_ms == null ? "—" : r.avg_latency_ms + "ms";
+  c.rt.className = "num" + (r.avg_latency_ms == null ? " zero" : "");
+  c.rt.title = r.last_latency_ms == null ? "" : "last " + r.last_latency_ms + "ms";
+  setCount(c.req, r.requests);
+  setCount(c.ok, r.successes);
+  setCount(c.solv, r.solves);
+  setCount(c.rl, r.rate_limits, "warn");
+  setCount(c.blk, r.blocks, "bad");
+  setCount(c.to, r.timeouts, "warn");
+  c.knee.textContent = r.knee_estimate == null ? "—" : r.knee_estimate;
+  c.knee.className = "num" + (r.knee_estimate == null ? " zero" : "");
+  c.lastok.textContent = fmtAge(ageOf(r.last_ok_unix));
+  c.probed.textContent = fmtAge(ageOf(r.last_probe_unix));
+  c.copy.title = "copy " + r.proxy_url;
+  c.copy.onclick = () => copyProxy(r.proxy_url, c.copy);
+}
+
+function renderExits() {
+  const n = exitData.size;
+  $("exits-count").textContent = n || "—";
+  $("exits-empty").hidden = n > 0;
+  $("exits-table").hidden = n === 0;
+  const body = $("exits-body");
+
+  // A full rebuild (init / re-seed): drop every row and repaint from scratch.
+  if (exitRebuild) {
+    for (const [, dom] of exitDom) dom.tr.remove();
+    exitDom.clear();
+    exitDirty = new Set(exitData.keys());
+    exitRebuild = false;
+    exitResort = true;
+  }
+
+  // Surgical patch: touch only the rows that actually changed.
+  for (const code of exitDirty) {
+    const r = exitData.get(code);
+    let dom = exitDom.get(code);
+    if (!dom) { dom = makeExitRow(); exitDom.set(code, dom); body.appendChild(dom.tr); exitResort = true; }
+    const badge = badgeOf(r);
+    if (dom.badge !== badge) exitResort = true;   // position depends on badge → needs a re-sort
+    dom.badge = badge;
+    updateExitRow(dom, r, badge);
+  }
+  exitDirty.clear();
+
+  // Census + cleared count from the full set (cheap: a Map scan, at most once per frame).
+  const counts = {};
+  let cleared = 0;
+  for (const r of exitData.values()) {
+    const dom = exitDom.get(r.code);
+    const badge = dom ? dom.badge : badgeOf(r);
+    counts[badge] = (counts[badge] || 0) + 1;
+    if (r.warm) cleared++;   // warm-store size: any usable clearance, servable now or not
+  }
+  $("cleared-count").textContent = cleared;
+  renderCensus(counts);
+
+  // Re-order only when a badge changed / a row was added — and never under the cursor.
+  if (exitResort && !exitsHover) {
+    [...exitData.values()]
+      .sort((a, b) => ((BADGE_RANK[exitDom.get(a.code).badge] ?? 99) - (BADGE_RANK[exitDom.get(b.code).badge] ?? 99))
+        || ((a.latency_ms ?? 1e9) - (b.latency_ms ?? 1e9)))
+      .forEach(r => body.appendChild(exitDom.get(r.code).tr));
+    exitResort = false;
+  }
+}
+
+function render() {
+  renderBrowsers();
+  renderGhosts();
+  renderExits();
+  renderJobProgress();
+  if (!$("overlay").hidden) updateOverlayBar();
+}
+
+// The job-progress strip: counts + rate always, plus a percent/bar/ETA when the total is known.
+// Hidden until a fetch_all batch publishes its first tick.
+const nf = new Intl.NumberFormat();
+function fmtEta(s) {
+  if (s == null) return null;
+  if (s >= 3600) return "~" + Math.round(s / 3600) + "h";
+  if (s >= 90) return "~" + Math.round(s / 60) + "m";
+  return "~" + Math.max(1, Math.round(s)) + "s";
+}
+function renderJobProgress() {
+  const p = jobProgress;
+  const box = $("jobprog");
+  if (!p) { box.hidden = true; return; }
+  box.hidden = false;
+  const sep = '<span class="sep">·</span>';
+  const parts = [];
+  if (p.total != null) {
+    const pct = p.total ? Math.floor((p.done / p.total) * 100) : 100;
+    parts.push(`fetched <b>${nf.format(p.done)}</b> <span class="dim">/ ${nf.format(p.total)}</span> (${pct}%)`);
+  } else {
+    parts.push(`fetched <b>${nf.format(p.done)}</b>`);
+  }
+  parts.push(`in-flight ${nf.format(p.in_flight)}`);
+  parts.push(`${nf.format(Math.round(p.per_sec))}/s`);
+  const eta = fmtEta(p.eta_secs);
+  if (eta && p.in_flight > 0) parts.push(`ETA ${eta}`);
+  if (p.err > 0) parts.push(`<span class="err">${nf.format(p.err)} failed</span>`);
+  $("jp-text").innerHTML = parts.join(sep);
+
+  const bar = $("jp-bar");
+  if (p.total != null && p.total > 0) {
+    bar.hidden = false;
+    $("jp-fill").style.width = Math.min(100, (p.done / p.total) * 100) + "%";
+  } else {
+    bar.hidden = true;
+  }
+}
+
+// Collapsible carousels: the header toggles its section (live starts open, failed collapsed).
+document.querySelectorAll(".carhead").forEach(h =>
+  h.addEventListener("click", () => h.parentElement.classList.toggle("collapsed")));
+
+$("ov-close").addEventListener("click", closeOverlay);
+$("overlay").addEventListener("click", (e) => { if (e.target.id === "overlay") closeOverlay(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeOverlay(); });
+$("exits").addEventListener("pointerenter", () => { exitsHover = true; });
+$("exits").addEventListener("pointerleave", () => { exitsHover = false; scheduleRender(); });
+
+setInterval(scheduleRender, 1000);
+
+connect();
+</script>
+</body>
+</html>

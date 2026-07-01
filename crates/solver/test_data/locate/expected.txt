@@ -1,0 +1,50 @@
+# Expected locator verdict per fixture. Decouples the verdict (the test's
+# concern) from the filename (yours) — so captures keep stable, human-readable
+# names and adding one is: drop the PNG here + add a line below. Every PNG in
+# this dir must be listed (the corpus test fails on an unlisted "orphan"), so a
+# new capture can't slip in unclassified.
+#
+# Format:  <verdict> <file> [<x> <y>]
+#   verdict : none | estimate | precise
+#   x y     : optional — assert the target center is within a few px of (x,y).
+#             Omit for estimates (the pre-hover point is approximate) and none.
+#
+# This pins the locator's CURRENT verdict (a regression lock). Where that
+# differs from the human-obvious truth, the comment says why.
+
+# --- a real fragrantica solve, in order (also the reel test) -------------------
+none      01_spinner_fragrantica.png               # bare "Performing security verification" spinner, no logo yet
+estimate  02_verifying_fragrantica.png             # logo + in-widget spinner, checkbox not drawn
+precise   03_checkbox_fragrantica.png   575 391     # the hollow checkbox — with the browser tab bar in frame
+estimate  04_checkbox_clicked_fragrantica.png      # box now checked (orange ✓) — correctly NOT precise, so no re-click
+estimate  05_verifying_again_fragrantica.png       # post-click "Verifying you are human" spinner
+none      06_cleared_fragrantica.png               # "Verification successful. Waiting to respond."
+
+# 07 is the fully-loaded page. The locator false-anchors on content orange
+# (perfume bottles, lemons, review thumbnails) and returns an estimate. This is
+# HARMLESS: the locator is only consulted during a challenge (detection is
+# title-gated), never after clearing — so it never misfires in production. The
+# human-obvious truth is `none`; we lock the actual `estimate` and this comment
+# so a future change to either is noticed. Do NOT "fix" with orange-cluster
+# hardening — that risks real challenge detection for zero production gain.
+estimate  07_page_loaded_fragrantica.png
+
+# --- a real ultimate-guitar solve, in order (second site) ---------------------
+# Same progression as fragrantica. Note 03's checkbox sits at a different y (302
+# vs 391) — coords are per-fixture for exactly this reason. And 07 here is `none`:
+# this page lacks the warm imagery that makes fragrantica's loaded page
+# false-anchor, so the quirk is content-specific, not a blanket locator failure.
+none      00_before_spinner_ultimateguitar.png
+estimate  02_verifying_ultimateguitar.png
+precise   03_checkbox_ultimate-guitar.png   575 302
+estimate  04_checkbox_clicked_ultimateguitar.png
+estimate  05_verifying_again_ultimateguitar.png
+none      06_cleared_ultimateguitar.png
+none      07_page_loaded_ultimateguitar.png
+
+# --- one CDP-viewport capture: a distinct space the framebuffer shots don't ---
+# Chrome-less, 1366x768 (vs the 1920-wide framebuffer grabs), checkbox at the
+# viewport y. Proves find_target is coordinate-space-agnostic (handles a raw CDP
+# screenshot, not just a framebuffer grab). One sample is enough — the dropped
+# siblings were the same scene at the same coords.
+precise   precise_fragrantica_cdp_x255_y336.png   255 336
