@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn page_origin_reached_with_preloaded_challenge_js() {
         assert_eq!(
-            from_page("Fragrantica", "<script src=/challenge-platform/x.js>"),
+            from_page("Example Store", "<script src=/challenge-platform/x.js>"),
             None
         );
     }

@@ -53,7 +53,8 @@ impl Method {
 /// One slim HTTP request: a URL plus optional method/headers/body. A bare `GET` (the default) is
 /// what the HTML bulk path uses; method/headers/body let non-HTML traffic — e.g. an Algolia POST —
 /// ride the same exit pool. When a clearance is replayed, its UA + cookie headers are added on top
-/// (and the host is rewritten to the clearance's host); custom `headers` never overwrite those.
+/// of the URL **as written** (no host rewrite — routing is exact, so the clearance host already
+/// equals the request host); custom `headers` never overwrite those.
 #[derive(Clone, Debug, Default)]
 pub struct Request {
     pub url: String,
@@ -107,12 +108,7 @@ pub async fn fetch(
     req: &Request,
     clearance: Option<&Clearance>,
 ) -> Result<Vec<u8>, Reason> {
-    let target = match clearance {
-        Some(c) if !c.host.is_empty() => rewrite_host(&req.url, &c.host),
-        _ => req.url.clone(),
-    };
-
-    let mut r = client.request(req.method.to_wreq(), &target);
+    let mut r = client.request(req.method.to_wreq(), &req.url);
     if let Some(c) = clearance {
         r = r.header("user-agent", c.user_agent.clone());
         let cookies = c.cookie_header();
@@ -142,19 +138,6 @@ pub async fn fetch(
     match classify::from_http(status, mitigated, &sniff) {
         None => Ok(bytes.to_vec()),
         Some(reason) => Err(reason),
-    }
-}
-
-fn rewrite_host(url: &str, host: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut u) => {
-            if u.set_host(Some(host)).is_ok() {
-                u.to_string()
-            } else {
-                url.to_string()
-            }
-        }
-        Err(_) => url.to_string(),
     }
 }
 

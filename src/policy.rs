@@ -15,6 +15,12 @@ use std::time::Duration;
 pub const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(60);
 pub const BURN_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 pub const TRANSIENT_COOLDOWN: Duration = Duration::from_secs(30);
+/// Escalation bounds for the **domain-level** backoff a confirmed structural redirect mismatch
+/// earns (see `worker::Shared::note_redirect_mismatch`) — deliberately much longer than any
+/// per-exit cooldown above: this is a *config* problem, not exit noise, so the floor starts higher
+/// and the ceiling is a rare re-check rather than a fast retry.
+pub const REDIRECT_MISMATCH_BACKOFF_BASE: Duration = Duration::from_secs(60);
+pub const REDIRECT_MISMATCH_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// Tunables for retry/cooldown behaviour, the headed-solve deadlines, pacing, and probing. Read off
 /// [`Config::policy`](crate::Config::policy); [`Policy::default`] is sensible for most runs.
@@ -45,6 +51,11 @@ pub struct Policy {
     pub slim_timeout: Duration,
     /// Connect timeout for a slim HTTP fetch.
     pub slim_connect_timeout: Duration,
+    /// Base of the escalating **domain-level** backoff a confirmed structural redirect mismatch
+    /// earns (see `REDIRECT_MISMATCH_BACKOFF_BASE`'s docs).
+    pub redirect_mismatch_backoff_base: Duration,
+    /// Ceiling of the domain-level redirect-mismatch backoff.
+    pub redirect_mismatch_backoff_max: Duration,
 }
 
 impl Default for Policy {
@@ -60,6 +71,8 @@ impl Default for Policy {
             probe_concurrency: 64,
             slim_timeout: crate::slim::DEFAULT_TIMEOUT,
             slim_connect_timeout: crate::slim::DEFAULT_CONNECT_TIMEOUT,
+            redirect_mismatch_backoff_base: REDIRECT_MISMATCH_BACKOFF_BASE,
+            redirect_mismatch_backoff_max: REDIRECT_MISMATCH_BACKOFF_MAX,
         }
     }
 }

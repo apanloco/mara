@@ -52,6 +52,55 @@ pub fn decide_slim(reason: Reason, attempts_left: u32) -> SlimAction {
     }
 }
 
+/// The four ways a **solve-host slim challenge** resolves. The worker applies the side effects
+/// (drop the stale cookie, bench the exit); this is the pure routing that pins the outcome — and,
+/// crucially, guarantees `fetch_all` terminates: every path ends in a give-up or `Escalate`, and the
+/// only looping path (`RetrySlim`) decrements the rotation budget each time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeAction {
+    /// slim has *never once* served → the fingerprint triple is the prime suspect (not a stray
+    /// page). Give up so the misconfiguration surfaces rather than browsering every request.
+    GiveUp,
+    /// A stale/loaded cookie — the winnable case. Re-warm and retry slim on a fresh clearance.
+    RetrySlim,
+    /// Either a **fresh** cookie was rejected (a per-URL CF challenge a cookie can't satisfy) or the
+    /// retry budget is spent — fetch the URL in a real browser instead.
+    Escalate,
+    /// The **domain itself** — not this one exit — is confirmed structurally misconfigured (solve
+    /// keeps landing on a different host whose clearance never validates against the configured
+    /// one). Retrying just repeats the same failure on every exit, and escalating would "succeed" by
+    /// browsering every request forever without ever telling anyone. Give up immediately, ahead of
+    /// the rotation budget — continuing to spend it here can't change the outcome.
+    GiveUpMisconfigured,
+}
+
+/// Route a solve-host slim challenge. A domain confirmed structurally misconfigured (see
+/// [`ChallengeAction::GiveUpMisconfigured`]) short-circuits everything else — no amount of
+/// retrying or escalating fixes a redirect to the wrong host. Otherwise, re-warm and retry slim
+/// while the rotation budget lasts — a *transient* challenge (a stale cookie, a one-off CF hiccup)
+/// clears on the next fresh clearance and never escalates. Only a challenge that survives the
+/// *whole* budget is genuinely per-URL-hard: then either **escalate** to a headed fetch (when the
+/// fingerprint triple is trustworthy — the Chrome↔TLS pin matches, or slim has already served) or
+/// **give up** `FingerprintMismatch` (a broken triple: pin mismatched *and* slim never served, so
+/// browsering every request would only mask the misconfig). Retrying before escalating is what
+/// keeps escalations rare — only the truly-unclearable URLs draw a browser, so they never flood the
+/// scarce solve budget the maintainer needs for warming.
+pub fn decide_challenge(
+    escalate_allowed: bool,
+    attempts_left: u32,
+    domain_misconfigured: bool,
+) -> ChallengeAction {
+    if domain_misconfigured {
+        ChallengeAction::GiveUpMisconfigured
+    } else if attempts_left > 0 {
+        ChallengeAction::RetrySlim
+    } else if escalate_allowed {
+        ChallengeAction::Escalate
+    } else {
+        ChallengeAction::GiveUp
+    }
+}
+
 /// Route a headed-step failure: an unreachable exit is dead, everything else cools. Rotate
 /// while attempts remain, otherwise fail — keeping the status either way.
 pub fn decide_headed(reason: Reason, attempts_left: u32) -> HeadedAction {
@@ -110,6 +159,41 @@ mod tests {
                 "{r:?}"
             );
         }
+    }
+
+    #[test]
+    fn challenge_retries_slim_while_budget_lasts() {
+        // A transient challenge clears on a slim retry, so we always retry before escalating —
+        // regardless of whether escalation would eventually be allowed.
+        assert_eq!(decide_challenge(true, 3, false), ChallengeAction::RetrySlim);
+        assert_eq!(
+            decide_challenge(false, 3, false),
+            ChallengeAction::RetrySlim
+        );
+    }
+
+    #[test]
+    fn budget_exhausted_escalates_when_allowed_else_gives_up() {
+        // Survived the whole budget → genuinely per-URL-hard: escalate to a browser when the
+        // fingerprint's trustworthy…
+        assert_eq!(decide_challenge(true, 0, false), ChallengeAction::Escalate);
+        // …else give up FingerprintMismatch (broken triple — don't browser every request).
+        assert_eq!(decide_challenge(false, 0, false), ChallengeAction::GiveUp);
+    }
+
+    #[test]
+    fn misconfigured_domain_gives_up_immediately_regardless_of_budget_or_fingerprint() {
+        // A confirmed-misconfigured domain short-circuits everything else — plenty of budget left
+        // and a trustworthy fingerprint don't matter, because retrying/escalating can't fix a
+        // redirect to the wrong host.
+        assert_eq!(
+            decide_challenge(true, 3, true),
+            ChallengeAction::GiveUpMisconfigured
+        );
+        assert_eq!(
+            decide_challenge(false, 0, true),
+            ChallengeAction::GiveUpMisconfigured
+        );
     }
 
     #[test]

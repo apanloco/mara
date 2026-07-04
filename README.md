@@ -1,6 +1,6 @@
 # mara
 
-A high-performance scraper that clears bot-protection challenges.
+A high-performance scraper that clears challenges over a rotating pool of egress IPs.
 
 [![crates.io](https://img.shields.io/crates/v/mara.svg)](https://crates.io/crates/mara)
 [![docs.rs](https://img.shields.io/docsrs/mara)](https://docs.rs/mara)
@@ -11,11 +11,11 @@ A high-performance scraper that clears bot-protection challenges.
 ## Features
 
 - **API** - Rust api for scraping
-- **Very high performance** - throughput scales with warm exits, not browsers, and memory stays flat whether the batch is ten URLs or a hundred million.
-- **Live dashboard** - A single-page UI detailing how the scraping goes
-- **Clears challenges** - solves challenges in a real browser on a virtual framebuffer
+- **Very high performance** - throughput scales with warm exits
+- **Live dashboard** - a single-page UI detailing how the scraping goes
+- **Clears challenges** - solves challenges in real browsers on virtual framebuffers
 - **Low resource usage** - scrapes with slim clients using cookies from completed challenges
-- **Manages a pool of exits** - Checks latency and other issues and distributes load
+- **Manages a pool of exits** - continuously monitors exit latency and distributes load
 
 ![mara's live dashboard](https://raw.githubusercontent.com/apanloco/mara/main/ui.png)
 
@@ -42,16 +42,25 @@ Add the crate:
 
 ```toml
 [dependencies]
-mara = "0.1"
+mara = "0.2"
 ```
 
 ```rust
 use futures::StreamExt;
-use mara::{Client, Config};
+use mara::{Client, Config, Domain};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = Client::new(Config::default()).await?;
+    let client = Client::new(Config {
+        // Every host you fetch must be registered here — exact match, no suffix fallback.
+        domains: vec![
+            // Challenge-protected: solve once in a browser, then replay the cookie slim,
+            // paced to at most 20 req/min per exit (defends a per-IP rate limit).
+            Domain::solve("example.com").per_ip(20),
+        ],
+        ..Default::default()
+    })
+    .await?;
 
     // One result per input URL, in completion order. Bare URL strings work directly.
     let mut results = client.fetch_all(["https://example.com/a", "https://example.com/b"]);
@@ -77,7 +86,7 @@ $ cargo run -p mara-cli --release -- capture https://example.com                
 $ cargo run -p mara-cli --release -- doctor                                              # check the environment
 ```
 
-The `fetch` command registers each target host as Cloudflare-protected by default;
+The `fetch` command registers each target host as protected by default;
 pass `--raw` to fetch a host as-is without the solve path.
 
 ## License

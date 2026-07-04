@@ -15,7 +15,9 @@ pub(crate) struct Fingerprint {
     pub chrome_major: Option<u32>,
 }
 
-/// Cumulative per-exit counters, persisted across runs and surfaced via [`Client::snapshot`](crate::Client::snapshot).
+/// Per-exit counters for the **current run**, surfaced via [`Client::snapshot`](crate::Client::snapshot).
+/// Deliberately **not** persisted: each run starts from zero so the dashboard reflects *this* run,
+/// not a lifetime total accumulated across every past scrape. Only clearances survive across runs.
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Stats {
     /// Total requests served over this exit.
@@ -67,12 +69,15 @@ pub(crate) struct ExitData {
     cooling_reason: Option<Cooling>,
     requests_since_clear: u64,
     consecutive_timeouts: u32,
-    /// Consecutive slim challenges with no successful serve in between (reset by `record_success`).
-    /// Drives the **escalating challenge cooldown**: an exit the browser can warm but whose slim
-    /// replay keeps getting challenged (a CF-flagged IP) is benched for longer and longer, so the
-    /// fastest-first maintainer stops pouring browser solves into it. A healthy exit whose cookie
-    /// occasionally expires serves in between → the streak resets → it's only ever briefly cooled.
-    consecutive_challenges: u32,
+    /// Consecutive slim challenges with no successful serve **of that same host** in between (reset
+    /// by `record_success`), keyed **per host**. Drives the **escalating challenge cooldown**: an
+    /// exit the browser can warm but whose slim replay keeps getting challenged (a CF-flagged IP) is
+    /// benched for longer and longer, so the fastest-first maintainer stops pouring browser solves
+    /// into it. A healthy exit whose cookie occasionally expires serves in between → the streak
+    /// resets → it's only ever briefly cooled. Keyed per host (not exit-global) so a healthy second
+    /// domain sharing this exit can't reset a different, genuinely-broken domain's streak — an exit
+    /// serving both must let each host's escalation run independently.
+    consecutive_challenges: HashMap<String, u32>,
     /// Per-domain **pace deadline**: the earliest instant this exit may serve that domain again
     /// (last-served + the domain's rate `interval`). In-memory only — pacing is a live throttle, not
     /// durable state. Distinct from `cooldown` (a penalty that makes the exit unleasable and can
@@ -86,11 +91,11 @@ impl ExitData {
         self.requests_since_clear += 1;
     }
 
-    pub fn record_success(&mut self, latency: Duration) {
+    pub fn record_success(&mut self, host: &str, latency: Duration) {
         self.stats.successes += 1;
         self.stats.last_ok_unix = Some(now_unix());
         self.consecutive_timeouts = 0;
-        self.consecutive_challenges = 0;
+        self.consecutive_challenges.remove(host);
         let ms = latency.as_millis() as u64;
         self.stats.last_latency_ms = Some(ms);
         self.stats.avg_latency_ms =
@@ -133,11 +138,13 @@ impl ExitData {
     /// climbs → long bench → the maintainer stops re-warming it).
     pub fn record_challenge(&mut self, host: &str, base: Duration, max: Duration) {
         self.clearances.remove(host);
-        self.consecutive_challenges = self.consecutive_challenges.saturating_add(1);
-        self.cool(
-            timeout_cooldown(self.consecutive_challenges, base, max),
-            Cooling::Transient,
-        );
+        let entry = self
+            .consecutive_challenges
+            .entry(host.to_string())
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+        let streak = *entry;
+        self.cool(timeout_cooldown(streak, base, max), Cooling::Transient);
     }
 
     pub(crate) fn cool(&mut self, cooldown: Duration, reason: Cooling) {
@@ -226,6 +233,7 @@ impl ExitData {
                 age_secs: c.age_secs(),
                 expires_unix: c.expires_unix,
                 expires_in_secs: c.expires_unix.map(|x| (x - now) as i64),
+                stale: c.is_stale(),
             })
             .collect();
         let stats = ExitStatsInfo {
@@ -239,13 +247,14 @@ impl ExitData {
     }
 }
 
+/// On-disk per-exit record. Only **clearances** persist across runs — stats are per-run
+/// (see [`Stats`]) and never written. A legacy file's `stats` key deserializes into nothing
+/// (serde ignores unknown fields) and is dropped on the next save.
 #[derive(Serialize, Deserialize)]
 struct PersistedExit {
     key: String,
     #[serde(default)]
     clearances: HashMap<String, Clearance>,
-    #[serde(default)]
-    stats: Stats,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -269,6 +278,12 @@ pub struct ClearanceInfo {
     pub expires_unix: Option<f64>,
     /// Seconds until expiry (negative if already expired), if known.
     pub expires_in_secs: Option<i64>,
+    /// Whether this clearance is too old to use (mirrors the crate's internal `Clearance::is_stale`).
+    /// The per-host truth: a consumer that needs "is *this* host actually warm on *this* exit" (not
+    /// the coarser per-exit [`ExitStatsInfo::warm`]) should filter on this rather than re-derive
+    /// staleness from `expires_in_secs`/`age_secs` (the fallback-TTL leg when expiry is unknown isn't
+    /// otherwise reconstructable outside this crate).
+    pub stale: bool,
 }
 
 /// Per-exit stats plus its current warmth/cooldown disposition.
@@ -384,7 +399,6 @@ impl Persistence {
         }
         ExitData {
             clearances: pe.clearances,
-            stats: pe.stats,
             ..Default::default()
         }
     }
@@ -394,7 +408,6 @@ impl Persistence {
         let pe = PersistedExit {
             key: exit_key.to_string(),
             clearances: data.clearances.clone(),
-            stats: data.stats.clone(),
         };
         let exit_dir = dir.join("exits").join(sanitize(exit_key));
         let _ = std::fs::create_dir_all(&exit_dir);
@@ -471,7 +484,10 @@ fn write_json<T: Serialize>(path: &std::path::Path, value: &T) {
     }
 }
 
-fn timeout_cooldown(consecutive: u32, base: Duration, max: Duration) -> Duration {
+/// Linear-capped escalation shared by every "streak of bad events → longer bench" cooldown in the
+/// crate (a per-host slim-challenge streak here; a per-domain confirmed-misconfiguration streak in
+/// `worker`): `base × streak`, capped at `max`.
+pub(crate) fn timeout_cooldown(consecutive: u32, base: Duration, max: Duration) -> Duration {
     (base * consecutive).min(max)
 }
 
@@ -538,12 +554,36 @@ mod tests {
 
         // A successful serve resets the streak, so the next challenge starts from the base again —
         // a healthy exit whose cookie occasionally expires is never benched for long.
-        d.record_success(Duration::from_millis(5));
+        d.record_success("h", Duration::from_millis(5));
         d.record_clearance("h", clr());
         d.record_challenge("h", base, max);
         assert!(
             remaining(&d) <= first + Duration::from_secs(1),
             "a successful serve resets the challenge streak"
+        );
+    }
+
+    #[test]
+    fn challenge_streak_is_per_host_not_exit_wide() {
+        // An exit serving two domains: "good" keeps succeeding, "bad" keeps getting challenged.
+        // "good"'s successes must not reset "bad"'s streak — otherwise a healthy second domain
+        // sharing the exit would mask a genuinely broken one and it would never escalate past the
+        // base cooldown.
+        let base = Duration::from_secs(30);
+        let max = Duration::from_secs(600);
+        let mut d = ExitData::default();
+        d.record_clearance("bad", clr());
+        d.record_challenge("bad", base, max);
+        let first = d.cooling_until().unwrap();
+
+        d.record_success("good", Duration::from_millis(5));
+        d.record_clearance("bad", clr());
+        d.record_challenge("bad", base, max);
+        let second = d.cooling_until().unwrap();
+
+        assert!(
+            second > first,
+            "an unrelated host's success must not reset this host's challenge streak"
         );
     }
 
@@ -580,7 +620,7 @@ mod tests {
             "a timed-out exit is cooled out of the warm set"
         );
 
-        d.record_success(Duration::from_millis(500));
+        d.record_success("h", Duration::from_millis(500));
         assert_eq!(d.consecutive_timeouts, 0, "a clear resets the streak");
         assert_eq!(
             d.stats.timeouts, 2,
@@ -645,6 +685,26 @@ mod tests {
     }
 
     #[test]
+    fn inspection_rows_reports_staleness_per_clearance() {
+        let mut d = ExitData::default();
+        d.record_clearance("fresh.example", clr());
+        d.record_clearance(
+            "stale.example",
+            Clearance::new(vec![], "UA".into(), Some(now_unix() - 10.0), String::new()),
+        );
+        let (clearances, _) = d.inspection_rows("exit1");
+        let stale_of = |host: &str| {
+            clearances
+                .iter()
+                .find(|c| c.host == host)
+                .unwrap_or_else(|| panic!("no row for {host}"))
+                .stale
+        };
+        assert!(!stale_of("fresh.example"));
+        assert!(stale_of("stale.example"));
+    }
+
+    #[test]
     fn ephemeral_persistence_is_noop_but_usable() {
         let p = Persistence::open(None, "Chrome147");
         assert!(!p.is_persistent());
@@ -659,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_survives_reload() {
+    fn clearances_survive_reload_but_stats_do_not() {
         let dir = tempfile::tempdir().unwrap();
         {
             let p = Persistence::open(Some(dir.path().into()), "Chrome147");
@@ -675,12 +735,12 @@ mod tests {
             d.warm_clearance("example.com").is_some(),
             "clearance should persist across reload"
         );
-        assert_eq!(d.stats.solves, 1);
-        assert_eq!(d.stats.rate_limits, 1, "stats persist across reload");
+        assert_eq!(d.stats.solves, 0, "stats are per-run, never persisted");
+        assert_eq!(d.stats.rate_limits, 0, "stats are per-run, never persisted");
     }
 
     #[test]
-    fn tls_profile_drift_discards_clearances_keeps_stats() {
+    fn tls_profile_drift_discards_clearances() {
         let dir = tempfile::tempdir().unwrap();
         {
             let p = Persistence::open(Some(dir.path().into()), "Chrome147");
@@ -694,7 +754,6 @@ mod tests {
             d.warm_clearance("example.com").is_none(),
             "drift must discard clearances"
         );
-        assert_eq!(d.stats.solves, 1);
     }
 
     #[test]

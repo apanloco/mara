@@ -27,8 +27,8 @@ pub(crate) fn per_min_interval(per_min: u32) -> Duration {
     Duration::from_secs(60) / per_min.max(1)
 }
 
-/// A configured domain, suffix-matched (longest wins), so `fragrantica.com` covers
-/// `www.fragrantica.com`. Two **orthogonal** rate ceilings, both in requests-per-minute and both
+/// A configured domain, matched by **exact host** — `example.com` does **not** cover
+/// `www.example.com`; register each host you fetch. Two **orthogonal** rate ceilings, both in requests-per-minute and both
 /// optional (compose freely):
 /// - `per_ip` — at most this many req/min **per exit** (even spacing on each IP). The defense
 ///   against a per-IP limit like Cloudflare's `1015`; scale aggregate throughput with more warm IPs.
@@ -37,8 +37,8 @@ pub(crate) fn per_min_interval(per_min: u32) -> Duration {
 ///   pool-wide pacer; breadth is irrelevant to it.
 #[derive(Clone, Debug)]
 pub struct Domain {
-    /// The host this entry configures. Suffix-matched, longest wins — `fragrantica.com` covers
-    /// `www.fragrantica.com`.
+    /// The host this entry configures. Matched **exactly** — `example.com` does not cover
+    /// `www.example.com`.
     pub host: String,
     /// Whether this host is Cloudflare-protected. `true` takes the warm/solve/replay path; `false`
     /// is a plain raw host (fetched over the pool, no browser).
@@ -122,12 +122,13 @@ pub struct Config {
     pub policy: Policy,
     /// If set, the headed solver writes diagnostic captures (screenshots, DOM) under this directory.
     pub capture_dir: Option<PathBuf>,
-    /// Configured domains: which hosts are behind Cloudflare (`solve`) and their optional per-IP
-    /// rate ceilings. A request whose host suffix-matches a `solve` domain takes the
-    /// warm/solve/replay path; **every other host is fetched raw**. Register the CF hosts you scrape
-    /// here (or via `Client::enable_solving_for_domain`); an unregistered CF host gives up
-    /// `Challenged`, and no single challenged exit can drag a host onto the warm path — routing is
-    /// fixed, not auto-detected.
+    /// Configured domains — routing is **fully explicit and exact-matched**. Every host you fetch
+    /// must be registered here (or via `Client::enable_solving_for_domain`) as either a
+    /// `Domain::solve` (behind Cloudflare — warm/solve/replay path) or a `Domain::raw` (plain host,
+    /// fetched over the pool browser-free). There is **no suffix fallback** (`example.com` does
+    /// not cover `www.example.com`) and **no silent raw default**: a host with no exact match
+    /// fails [`FetchError::Unconfigured`] before any exit is leased. Routing is fixed, not
+    /// auto-detected — no single challenged exit can drag a host onto the warm path.
     pub domains: Vec<Domain>,
 }
 
@@ -478,8 +479,20 @@ where
 /// These variants are the genuinely-unwinnable cases only.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
-    /// Every rotation was exhausted with the [`Reason`] unresolved. The common cause is a raw
-    /// challenge on an **unregistered Cloudflare host** — register it as a solve [`Domain`].
+    /// The request's host is not in [`Config::domains`]. Routing is **fully explicit and
+    /// exact-matched**: every fetched host must be registered as either a solve [`Domain`]
+    /// (Cloudflare — `Domain::solve`) or a raw one (`Domain::raw`), with no suffix fallback
+    /// (`example.com` does **not** cover `www.example.com`) and no silent raw default.
+    /// Rejected before any exit is leased — register the exact host.
+    #[error("host `{host}` is not configured — add a Domain::solve or Domain::raw for it")]
+    Unconfigured {
+        /// The unconfigured request host.
+        host: String,
+    },
+
+    /// Every rotation was exhausted with the [`Reason`] unresolved. The common cause is a
+    /// challenge on a host configured **raw** that is actually Cloudflare-protected — reconfigure
+    /// it as a solve [`Domain`].
     #[error("fetch gave up after exhausting attempts: {0:?}")]
     GaveUp(Reason),
 
@@ -497,6 +510,22 @@ pub enum FetchError {
         reason: Reason,
     },
 
+    /// This host's solve keeps landing on a different host (`landed`) whose clearance never
+    /// validates against the configured one — confirmed across multiple exits, so it's a
+    /// **structural misconfiguration** (the wrong host is registered), not exit noise or a
+    /// transient challenge. Rejected before any exit is leased, like [`Unconfigured`](Self::Unconfigured);
+    /// register `landed` as its own [`Domain`] instead.
+    #[error(
+        "host `{host}` redirects during solve to `{landed}`, whose clearance never validates \
+         against `{host}` — register `{landed}` as its own domain instead"
+    )]
+    MisconfiguredHost {
+        /// The configured host that keeps redirecting.
+        host: String,
+        /// The host solving actually lands on.
+        landed: String,
+    },
+
     /// The whole pool was persistently resting (every exit cooling) past the lease timeout — a
     /// transient resting wave would have been waited out, so this means no exit could make progress.
     #[error("all exits resting; {}", match retry_after { Some(d) => format!("retry in ~{}s", d.as_secs()), None => "retry later".into() })]
@@ -509,6 +538,30 @@ pub enum FetchError {
     /// returned an error from [`fetch_browser`](Client::fetch_browser)).
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl FetchError {
+    /// Whether this is a **systematic configuration error** — identical for every request, so
+    /// retrying (this run or a later one) can't help. A caller streaming many resources should
+    /// **abort the whole batch and fix the setup** rather than defer-and-retry per resource: one
+    /// such failure means *all* of them will fail the same way. True for
+    /// [`Unconfigured`](Self::Unconfigured) (a host missing from [`Config::domains`]),
+    /// [`FingerprintMismatch`](Self::FingerprintMismatch) (the Chrome↔TLS↔UA pin is broken), and
+    /// [`MisconfiguredHost`](Self::MisconfiguredHost) (solve keeps redirecting to a host that never
+    /// validates — the wrong host is registered).
+    ///
+    /// The obstacle give-ups are **not** config errors — they're per-resource or transient, so
+    /// deferring and retrying is the right response: [`GaveUp`](Self::GaveUp) (this resource
+    /// exhausted its rotation), [`Resting`](Self::Resting) (a transient pool-wide rest), and
+    /// [`Other`](Self::Other).
+    pub fn is_config_error(&self) -> bool {
+        matches!(
+            self,
+            FetchError::Unconfigured { .. }
+                | FetchError::FingerprintMismatch { .. }
+                | FetchError::MisconfiguredHost { .. }
+        )
+    }
 }
 
 /// The entry point. Owns the exit pool, the per-exit serving workers, and the background
@@ -589,14 +642,34 @@ impl Client {
         // launching more browsers than exits).
         cfg.browsers = cfg.browsers.min(egress.exit_count()).max(1);
         let (browsers, mullvad) = (cfg.browsers, cfg.mullvad);
-        let shared = Shared::new(cfg, egress, persistence, introspect);
+        // One shared `locate_chrome` probe feeds both the fingerprint canary and the Chrome
+        // executable resolution below (avoids shelling out to find Chrome twice); off the async
+        // executor since it spawns subprocesses.
+        let located = tokio::task::spawn_blocking(crate::solver::session::locate_chrome).await?;
+        // The canary's verdict gates escalation: with the pin intact, a persistent slim challenge on
+        // a fresh clearance is a per-URL CF challenge (→ headed fetch), not a broken triple.
+        let fingerprint_ok = fingerprint_canary(&located);
+        // Resolve the Chrome executable — a `setpriv --pdeathsig` wrapper (removed on clean exit) so
+        // a hard-killed process can't orphan Chrome (see `session::ChromeExec`). Off the async
+        // executor too: it may shell out (`setpriv --version`) and does blocking file I/O.
+        let chrome_exec = tokio::task::spawn_blocking(move || {
+            crate::solver::session::ChromeExec::resolve(located)
+        })
+        .await?;
+        let shared = Shared::new(
+            cfg,
+            egress,
+            persistence,
+            introspect,
+            fingerprint_ok,
+            chrome_exec,
+        );
         let workers = WorkerPool::spawn(shared.clone());
         let serving = workers.count();
 
         let client = Client {
             inner: Arc::new(Inner { shared, workers }),
         };
-        fingerprint_canary().await;
         let (data_dir, persistent) = client.inner.shared.persistence.location();
         tracing::info!(browsers, serving, mullvad, persistent, data_dir = %data_dir.display(), "client ready");
         Ok(client)
@@ -768,9 +841,10 @@ impl Client {
         }
     }
 
-    /// Register `domain` as Cloudflare-protected: requests to it (and its subdomains — suffix
-    /// match) take the warm/solve/replay path instead of being fetched raw. The runtime equivalent
-    /// of adding a `Domain::solve(domain)` to `Config.domains`; call it for any CF host you scrape.
+    /// Register `domain` as Cloudflare-protected: requests to this **exact host** take the
+    /// warm/solve/replay path. The runtime equivalent of adding a `Domain::solve(domain)` to
+    /// `Config.domains`; call it for any CF host you scrape. Matching is exact — register
+    /// `www.example.com` and `example.com` separately if you fetch both.
     pub fn enable_solving_for_domain(&self, domain: impl Into<String>) {
         self.inner.shared.mark_solve_host(&domain.into());
     }
@@ -779,6 +853,15 @@ impl Client {
     /// — for an end-of-run summary or health readout.
     pub fn snapshot(&self) -> crate::store::StoreSnapshot {
         self.inner.shared.egress.snapshot()
+    }
+
+    /// Solve domains confirmed **structurally misconfigured**: solve keeps landing on a different
+    /// host whose clearance never validates against the one configured, seen repeatedly — not a
+    /// transient blip. Each entry is `(configured, landed)`; register `landed` as its own
+    /// [`Domain`] instead. Empty in the common case. Meant for an end-of-run summary, so an operator
+    /// learns the fix without needing `-v debug`.
+    pub fn misconfigured_domains(&self) -> Vec<(String, String)> {
+        self.inner.shared.misconfigured_domains()
     }
 
     /// The resolved worker count C (after auto/no-limit and the direct clamp) — i.e. how many
@@ -813,32 +896,41 @@ fn utf8_lossy(bytes: Vec<u8>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-async fn fingerprint_canary() {
-    let installed = tokio::task::spawn_blocking(crate::solver::session::installed_chrome_major)
-        .await
-        .ok()
-        .flatten();
+/// Check the installed Chrome major (from an already-`locate_chrome`d probe) against the pinned slim
+/// TLS profile at startup. Returns whether the pin **matches** (the fingerprint-triple leg mara can
+/// verify without a live replay) — the signal that a later persistent slim challenge is a per-URL CF
+/// challenge, not a broken triple. A mismatch or an unreadable Chrome returns `false` (fall back to
+/// the empirical `slim_ever_succeeded` gate rather than assume the triple is sound).
+fn fingerprint_canary(located: &Option<(String, String)>) -> bool {
+    let installed = crate::solver::session::chrome_major_from(located);
     match (installed, slim::profile_major()) {
-        (Some(installed), Some(pinned)) if installed != pinned => tracing::error!(
-            installed,
-            pinned,
-            profile = slim::PROFILE,
-            "fingerprint drift: installed Chrome {installed} != pinned slim profile {pinned} ({}); \
-             handed-down clearances will be REJECTED and clients stay stuck on the headed solver — bump \
-             wreq/wreq-util AND the Chrome binary in lockstep (see the fingerprint-triple invariant)",
-            slim::PROFILE,
-        ),
+        (Some(installed), Some(pinned)) if installed != pinned => {
+            tracing::error!(
+                installed,
+                pinned,
+                profile = slim::PROFILE,
+                "fingerprint drift: installed Chrome {installed} != pinned slim profile {pinned} ({}); \
+                 handed-down clearances will be REJECTED and clients stay stuck on the headed solver — bump \
+                 wreq/wreq-util AND the Chrome binary in lockstep (see the fingerprint-triple invariant)",
+                slim::PROFILE,
+            );
+            false
+        }
         (Some(installed), Some(_)) => {
             tracing::info!(
                 chrome_major = installed,
                 profile = slim::PROFILE,
                 "fingerprint canary ok"
-            )
+            );
+            true
         }
-        _ => tracing::debug!(
-            profile = slim::PROFILE,
-            "fingerprint canary skipped (Chrome version unreadable)"
-        ),
+        _ => {
+            tracing::debug!(
+                profile = slim::PROFILE,
+                "fingerprint canary skipped (Chrome version unreadable)"
+            );
+            false
+        }
     }
 }
 

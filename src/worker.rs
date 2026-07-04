@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,13 +14,15 @@ use tracing::Instrument;
 
 use crate::host_of;
 use crate::solver::browser::{Browser, Cleared, SolveConfig};
+use crate::solver::session::ChromeExec;
+use crate::wait_full_load;
 
 use crate::classify::Reason;
 use crate::clearance::Clearance;
 use crate::client::{Config, Domain, FetchError, FetchResult, Outcome, Resource, per_min_interval};
 use crate::egress::{Availability, ExitStatus, Lease};
 use crate::introspect::Introspector;
-use crate::ladder::{self, HeadedAction, Step};
+use crate::ladder::{self, ChallengeAction, HeadedAction, Step};
 use crate::policy::Policy;
 use crate::pool::ExitPool;
 use crate::slim::{self, Request};
@@ -103,7 +105,17 @@ pub(crate) struct Shared {
     browser_permits: Arc<Semaphore>,
     slim_clients: Mutex<HashMap<String, wreq::Client>>,
     slim_ever_succeeded: AtomicBool,
-    /// Configured domains (solve flag + per-IP / aggregate rates), suffix-matched (longest wins).
+    /// The startup fingerprint canary's verdict: the installed Chrome major matches the pinned slim
+    /// TLS profile. When true, a persistent slim challenge on a fresh clearance is a **per-URL** CF
+    /// challenge (escalate to headed), not a broken triple — so escalation is allowed even before
+    /// slim has served once (a batch of only per-URL-hard URLs still gets them). False (pin mismatch
+    /// or Chrome unreadable) falls back to the empirical `slim_ever_succeeded` gate.
+    fingerprint_ok: bool,
+    /// The Chrome executable every solve launches — the `setpriv --pdeathsig` wrapper that binds
+    /// Chrome's lifetime to ours (its `Drop` removes the wrapper on a clean exit). Owned here so it
+    /// outlives any worker that might launch a browser.
+    chrome_exec: ChromeExec,
+    /// Configured domains (solve flag + per-IP / aggregate rates), **exact-host matched**.
     /// Seeded from `cfg.domains` and grown at runtime by `mark_solve_host`. The resolvers below route
     /// each request and pace it.
     domains: Mutex<Vec<Domain>>,
@@ -119,7 +131,50 @@ pub(crate) struct Shared {
     /// Monotonic id stamped on every fetch's tracing span, so a single resource is greppable
     /// across the exits it serves on.
     req_counter: AtomicU64,
+    /// Per-**domain** (not per-exit) confirmed structural mismatches — see [`RedirectMismatch`].
+    /// Keyed by the configured host. Empty in the overwhelmingly common case.
+    redirect_mismatches: Mutex<HashMap<String, RedirectMismatch>>,
 }
+
+/// Confirmed-count and backoff state for a solve domain whose solve keeps landing on a different
+/// host than configured, where the landed-host clearance has been independently verified (not just
+/// suspected) not to work against the configured host. Distinct from
+/// [`ExitData::record_challenge`](crate::store): that's "one exit is flaky"; this is "every exit
+/// that tries this domain hits the same wall" — a config error, not exit noise.
+#[derive(Default)]
+struct RedirectMismatch {
+    /// How many times a self-verify has confirmed the mismatch **while independently trusted**
+    /// (never incremented by ordinary per-exit flakiness, and never by an untrusted or non-challenge
+    /// failure — see `note_redirect_mismatch`). Drives the operator-visible give-up
+    /// (`MisconfiguredHost`). Reset to absent by the next self-verify that *succeeds* — a live
+    /// streak, not a permanent verdict, so a config fix (or the site changing its redirect) heals it.
+    confirmed: u32,
+    /// Total self-verify failures (any reason, trusted or not) — drives the maintainer's `retry_after`
+    /// backoff. Unlike `confirmed` this needs no trust: even if the real cause is a broken fingerprint
+    /// (every solve-host replay challenges), re-solving in a browser can't fix it, so backing off
+    /// warming is only ever correct — and keying the backoff on `confirmed` instead would leave the
+    /// untrusted and non-challenge cases un-backed-off, re-solving them at full speed forever.
+    failures: u32,
+    /// The host solving actually landed on, for the operator-facing message.
+    landed: String,
+    /// The maintainer won't offer this domain to `lease_to_warm_any` before this instant —
+    /// escalating with `failures`, mirroring the per-exit challenge cooldown.
+    retry_after: Option<Instant>,
+    /// Set the instant *any* self-verify fails — trusted or not. Unlike `confirmed`, this needs no
+    /// trust: it only excludes the domain from `may_pull`'s "warm for every solve domain"
+    /// requirement, so a domain that will never warm can't force every *other* domain to wait on
+    /// it forever. Gating this on trust too would deadlock: trust itself comes from a domain
+    /// successfully serving, which can't happen while an unwarmable domain still blocks serving.
+    unwarmable_for_now: bool,
+}
+
+/// Confirmed occurrences before a domain is treated as misconfigured (backs off warming, then fails
+/// jobs targeting it) rather than a one-off blip. Kept small: the signal is already high-precision
+/// (a redirect *and* an independently-verified replay failure), so there's little to gain from
+/// waiting for more confirmations, and a lot to lose in wasted solves. Unlike the backoff duration
+/// (`Policy::redirect_mismatch_backoff_base`/`_max`), this count isn't exposed as a tunable — there's
+/// no run-to-run reason to want more or fewer confirmations before trusting the signal.
+const REDIRECT_MISMATCH_THRESHOLD: u32 = 2;
 
 impl Shared {
     pub fn new(
@@ -127,9 +182,14 @@ impl Shared {
         egress: Arc<ExitPool>,
         persistence: Arc<Persistence>,
         introspect: Arc<Introspector>,
+        fingerprint_ok: bool,
+        chrome_exec: ChromeExec,
     ) -> Arc<Self> {
         let browser_permits = Arc::new(Semaphore::new(cfg.browsers.max(1)));
         let domains = Mutex::new(cfg.domains.clone());
+        // A solve workload has exits "waiting to warm" (`cold`); a pure-raw one doesn't. Tell the
+        // dashboard so it splits leasable-idle exits into idle (warm/free) vs cold accordingly.
+        introspect.set_solving(cfg.domains.iter().any(|d| d.solve));
         Arc::new(Shared {
             cfg,
             egress,
@@ -138,12 +198,15 @@ impl Shared {
             browser_permits,
             slim_clients: Mutex::new(HashMap::new()),
             slim_ever_succeeded: AtomicBool::new(false),
+            fingerprint_ok,
+            chrome_exec,
             domains,
             aggregate_pacers: Mutex::new(HashMap::new()),
             shutdown: Arc::new(Notify::new()),
             solve_override: None,
             slim_override: None,
             req_counter: AtomicU64::new(0),
+            redirect_mismatches: Mutex::new(HashMap::new()),
         })
     }
 
@@ -153,21 +216,23 @@ impl Shared {
         if host.is_empty() {
             return;
         }
+        self.introspect.set_solving(true); // warming now applies → dashboard splits idle vs cold
         let mut domains = self.domains.lock().unwrap();
         if !domains.iter().any(|d| d.host == host) {
             domains.push(Domain::solve(host));
         }
     }
 
-    /// The configured domain covering `host` — **longest suffix wins** (exact match, or `host`
-    /// ends with `.{domain}`), or `None` if no domain matches (a raw host).
+    /// The configured domain for `host` — an **exact host match**, or `None` if `host` is not
+    /// configured. Matching is exact on purpose: `example.com` does **not** cover
+    /// `www.example.com`; register the precise host you fetch. An unmatched host is a caller
+    /// config error, not a raw fallback (see [`WorkerPool::submit`], which rejects it `Unconfigured`).
     fn domain_for(&self, host: &str) -> Option<Domain> {
         self.domains
             .lock()
             .unwrap()
             .iter()
-            .filter(|d| host == d.host || host.ends_with(&format!(".{}", d.host)))
-            .max_by_key(|d| d.host.len())
+            .find(|d| d.host == host)
             .cloned()
     }
 
@@ -183,10 +248,137 @@ impl Shared {
             .collect()
     }
 
-    /// The solve-domain covering `host` (the clearance key the maintainer warmed under), or `None`
-    /// if `host` is raw or matches only a non-solve domain.
+    /// The solve host matching `host` exactly (the clearance key the maintainer warmed under), or
+    /// `None` if `host` is configured raw or not configured at all.
     pub(crate) fn solve_domain_for(&self, host: &str) -> Option<String> {
         self.domain_for(host).filter(|d| d.solve).map(|d| d.host)
+    }
+
+    /// The registered solve domains a worker actually needs to be warm for before pulling *any*
+    /// job — every solve domain **except** one whose latest self-verify just failed (see
+    /// `RedirectMismatch::unwarmable_for_now`). Deliberately **not** gated on the trusted
+    /// `confirmed` streak: trust itself can only be established by *some* domain successfully
+    /// serving, which can't happen while an unwarmable domain still blocks every domain's serving —
+    /// gating this on trust would deadlock the whole pool the first time a broken domain is
+    /// registered before anything else has ever served.
+    fn solve_domains_needing_warmth(&self) -> Vec<String> {
+        let mismatches = self.redirect_mismatches.lock().unwrap();
+        self.solve_domains()
+            .into_iter()
+            .filter(|host| !mismatches.get(host).is_some_and(|m| m.unwarmable_for_now))
+            .collect()
+    }
+
+    /// The registered solve domains **minus** any currently backed off by a confirmed structural
+    /// mismatch — what the maintainer actually offers to `lease_to_warm_any`. A backed-off domain
+    /// reappears once its `retry_after` lapses (one more attempt: either it clears the mismatch —
+    /// e.g. the operator fixed the config and restarted — or re-confirms and backs off further).
+    fn warmable_solve_domains(&self) -> Vec<String> {
+        let now = Instant::now();
+        let mismatches = self.redirect_mismatches.lock().unwrap();
+        self.solve_domains()
+            .into_iter()
+            .filter(|host| {
+                mismatches
+                    .get(host)
+                    .and_then(|m| m.retry_after)
+                    .is_none_or(|until| now >= until)
+            })
+            .collect()
+    }
+
+    /// Record a redirect self-verify failure for `host` (landed on `landed`). Always marks the
+    /// domain `unwarmable_for_now` (see the field docs — no trust needed; it just stops other domains
+    /// waiting on it) **and** backs off the maintainer's warming with an escalating `retry_after`, so
+    /// a domain that never validates isn't re-solved in a browser at full speed forever — regardless
+    /// of trust, since re-solving can't fix either a config error or a broken fingerprint. Only bumps
+    /// the **confirmed**, operator-visible streak (→ `MisconfiguredHost`) when `trusted` independently
+    /// confirms slim itself works (the same `fingerprint_ok || slim_ever_succeeded` gate escalation
+    /// uses) — otherwise a broken fingerprint triple would look identical, and blaming this domain
+    /// would hide the real fix.
+    fn note_redirect_mismatch(&self, host: &str, landed: &str, trusted: bool) {
+        let mut mismatches = self.redirect_mismatches.lock().unwrap();
+        let entry = mismatches.entry(host.to_string()).or_default();
+        entry.unwarmable_for_now = true;
+        entry.landed = landed.to_string();
+        // Back off warming on *every* failure — keyed on `failures`, not `confirmed`, so the
+        // untrusted and non-challenge cases (which never bump `confirmed`) still get backed off
+        // instead of re-solved on loop. The backoff paces retries; it says nothing about blame.
+        let pol = self.policy();
+        entry.failures = entry.failures.saturating_add(1);
+        entry.retry_after = Some(
+            Instant::now()
+                + crate::store::timeout_cooldown(
+                    entry.failures,
+                    pol.redirect_mismatch_backoff_base,
+                    pol.redirect_mismatch_backoff_max,
+                ),
+        );
+        // The operator-facing "structurally misconfigured" verdict is higher-precision: only a
+        // trusted *challenge* self-verify counts toward it (see this method's doc and the callers).
+        if !trusted {
+            return;
+        }
+        entry.confirmed = entry.confirmed.saturating_add(1);
+        if entry.confirmed >= REDIRECT_MISMATCH_THRESHOLD {
+            tracing::error!(
+                configured = host,
+                landed,
+                confirmed = entry.confirmed,
+                "domain confirmed structurally misconfigured — solve keeps redirecting to a host \
+                 whose clearance never validates against the configured one; register the landed \
+                 host as its own domain instead"
+            );
+        }
+    }
+
+    /// A self-verify against `host` succeeded despite an earlier redirect — clear any accumulated
+    /// mismatch streak. Self-healing: a config fix (or the site's redirect changing) un-backs-off the
+    /// domain on the very next successful warm, same as a per-exit challenge streak resetting on serve.
+    fn reset_redirect_mismatch(&self, host: &str) {
+        self.redirect_mismatches.lock().unwrap().remove(host);
+    }
+
+    /// The landed host if `host` is confirmed structurally misconfigured (past the threshold), else
+    /// `None`. Gates both the job-level give-up (`ladder::decide_challenge`) and the pre-flight
+    /// rejection in `WorkerPool::submit`.
+    fn confirmed_misconfigured(&self, host: &str) -> Option<String> {
+        self.redirect_mismatches
+            .lock()
+            .unwrap()
+            .get(host)
+            .filter(|m| m.confirmed >= REDIRECT_MISMATCH_THRESHOLD)
+            .map(|m| m.landed.clone())
+    }
+
+    /// Whether `host`'s latest self-verify just failed (trusted or not — see
+    /// `RedirectMismatch::unwarmable_for_now`). A worker that pulls a job for a solve host with no
+    /// clearance normally just hands it back for a warm peer at no cost (a brief, self-correcting
+    /// race). That free retry is *only* safe because `may_pull` otherwise guarantees the exit was
+    /// warm for every solve domain before pulling anything — which no longer holds for a domain this
+    /// flag excludes from that gate. `serve_html` uses this to route such a pull down the challenge
+    /// ladder instead (spending the rotation budget so it can't spin the retry queue forever) — but
+    /// releasing the exit `Ok`, *not* cooled: the domain is broken pool-wide, not this exit, and the
+    /// single per-exit cooldown would poison a healthy domain sharing it.
+    fn is_redirect_suspect(&self, host: &str) -> bool {
+        self.redirect_mismatches
+            .lock()
+            .unwrap()
+            .get(host)
+            .is_some_and(|m| m.unwarmable_for_now)
+    }
+
+    /// Every solve domain confirmed structurally misconfigured right now, as `(configured, landed)`
+    /// pairs — surfaced so a caller's end-of-run summary can name the fix without needing `-v debug`.
+    /// Empty in the common case.
+    pub(crate) fn misconfigured_domains(&self) -> Vec<(String, String)> {
+        self.redirect_mismatches
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, m)| m.confirmed >= REDIRECT_MISMATCH_THRESHOLD)
+            .map(|(host, m)| (host.clone(), m.landed.clone()))
+            .collect()
     }
 
     /// Acquire this domain's slot in the **pool-wide** aggregate pacer, returning how long to sleep
@@ -334,7 +526,10 @@ impl Worker {
     /// Whether our exit can pull work right now: leasable (ready + idle + not cooling + under cap)
     /// and — when there are solve domains — warm for all of them (a raw workload needs no warmth).
     /// This is the pull-gate that makes the tail-latency guarantee hold: a cold/warming worker never
-    /// claims a resource, so warm idle workers finish the stragglers.
+    /// claims a resource, so warm idle workers finish the stragglers. "All of them" is
+    /// [`Shared::solve_domains_needing_warmth`] — every solve domain minus one whose self-verify
+    /// just failed, so a domain that can provably never warm can't starve every *other* domain's
+    /// jobs forever, waiting on a readiness this exit (or any exit) will never reach.
     fn may_pull(&self) -> bool {
         if !self.shared.egress.is_claimable(&self.code) {
             return false;
@@ -343,7 +538,7 @@ impl Worker {
         if self.shared.egress.paced_until(&self.code).is_some() {
             return false;
         }
-        let domains = self.shared.solve_domains();
+        let domains = self.shared.solve_domains_needing_warmth();
         domains.is_empty()
             || domains
                 .iter()
@@ -394,7 +589,7 @@ impl Worker {
             Availability::Available => FetchError::GaveUp(Reason::Unavailable),
         };
         tracing::error!("gave up — pool resting past the lease timeout");
-        self.deliver_err(job, err).await;
+        deliver_err(job, err).await;
         true
     }
 
@@ -472,17 +667,31 @@ impl Worker {
     ) {
         let host = host_of(&resource.url).unwrap_or_default();
         let exit_key = lease.key();
-        // Solve hosts replay a clearance keyed by the registered solve-*domain* (what the maintainer
-        // warmed), not the exact request host — so a suffix registration covers subdomains.
+        // Solve hosts replay a clearance keyed by the registered solve host (what the maintainer
+        // warmed) — the same exact host, since routing is exact-matched.
         let domain = self.shared.solve_domain_for(&host);
         let is_solve = domain.is_some();
         let clearance = domain
             .as_ref()
             .and_then(|d| self.shared.egress.warm(&exit_key, d));
 
-        // A solve host we're not actually warm for (multi-domain edge / a runtime registration
-        // race): don't hostage the resource — hand it back for a warm peer, no penalty.
+        // A solve host we're not actually warm for. The common case is a brief, self-correcting
+        // race (multi-domain edge / a runtime registration) — hand it back for a warm peer, no
+        // penalty. But a domain whose latest self-verify just failed (`is_redirect_suspect`) is
+        // excluded from `may_pull`'s "warm for every solve domain" gate precisely so it can't starve
+        // *other* domains — which means a worker can land here for it repeatedly, indefinitely, with
+        // no clearance ever coming. Run that case down the challenge ladder (spend the rotation
+        // budget, eventually give up) so it can't spin the retry queue forever — but release the
+        // exit `Ok`, *not* cooled: this domain is broken pool-wide (that's why it's out of the warmth
+        // gate), so it's not this exit's fault, and the single per-exit cooldown would poison a
+        // healthy domain sharing the exit. Rotating away wouldn't help anyway.
         if is_solve && clearance.is_none() {
+            if self.shared.is_redirect_suspect(&host) {
+                lease.release(ExitStatus::Ok);
+                self.resolve_challenge(exit_key, resource, index, started, results, attempts)
+                    .await;
+                return;
+            }
             lease.release(ExitStatus::Ok);
             self.requeue(Job::Html {
                 resource,
@@ -514,9 +723,15 @@ impl Worker {
                 );
             }
             let req = resource.to_request();
-            match self
-                .slim_request(&req, &exit_key, proxy.as_deref(), clearance.as_ref())
-                .await
+            match slim_request(
+                &self.shared,
+                &req,
+                &exit_key,
+                &host,
+                proxy.as_deref(),
+                clearance.as_ref(),
+            )
+            .await
             {
                 Ok(body) => {
                     tracing::info!(bytes = body.len(), raw = !is_solve, "slim served");
@@ -526,49 +741,11 @@ impl Worker {
                     self.deliver(index, &resource, &results, Ok(outcome)).await;
                 }
                 Err(reason) if is_solve && reason == Reason::Challenged => {
-                    // A challenge on a solve host despite a fresh clearance. Drop it and bench the
-                    // exit with an **escalating** cooldown (via `record_slim_challenge`): a one-off
-                    // stale cookie cools briefly and recovers (its streak resets on the next serve),
-                    // but a CF-flagged IP that never serves climbs to a long bench so the
-                    // fastest-first maintainer stops re-warming it on loop. The *resource* is
-                    // winnable, so it doesn't burn the rotation budget — retry forever on a good
-                    // exit. The exception is a **broken fingerprint triple**: if slim has *never*
-                    // once served, run down the budget and give up (FingerprintMismatch).
-                    let key = domain.as_deref().unwrap_or(&host); // clearance keyed by the solve-domain
-                    let pol = self.shared.policy();
-                    self.shared.egress.record_slim_challenge(
-                        &exit_key,
-                        key,
-                        pol.transient_cooldown,
-                        pol.burn_cooldown,
-                    );
-                    lease.release(ExitStatus::Cooled);
-                    if self.shared.slim_ever_succeeded.load(Ordering::Relaxed) {
-                        tracing::debug!("stale clearance · re-warming and retrying");
-                        self.requeue(Job::Html {
-                            resource,
-                            index,
-                            started,
-                            results,
-                            attempts,
-                        })
+                    // A challenge on a solve host despite holding a clearance — a stale/loaded
+                    // cookie. `challenged` re-warms and retries slim while the rotation budget
+                    // lasts, escalating or giving up only once it's spent (see its docs).
+                    self.challenged(lease, resource, index, started, results, attempts)
                         .await;
-                    } else {
-                        let left = attempts.saturating_sub(1);
-                        if left > 0 {
-                            self.requeue(Job::Html {
-                                resource,
-                                index,
-                                started,
-                                results,
-                                attempts: left,
-                            })
-                            .await;
-                        } else {
-                            let err = replay_giveup(&self.shared, reason, label); // → FingerprintMismatch
-                            self.deliver(index, &resource, &results, Err(err)).await;
-                        }
-                    }
                 }
                 Err(reason) => match self.apply_failure(lease, reason, &host, &label, attempts) {
                     Fail::Requeue { attempts } => {
@@ -589,6 +766,91 @@ impl Worker {
         }
         .instrument(span)
         .await;
+    }
+
+    /// A live solve-host challenge on a *held* clearance (a stale/loaded cookie). Bench **this exit**
+    /// with the escalating per-host cooldown — the fault is this exit's cookie, so cooling it and
+    /// rotating is right — then run the shared ladder. The clearance key (`record_slim_challenge`'s,
+    /// and the ladder's) is `resource`'s own host, since routing is exact-matched.
+    async fn challenged(
+        &self,
+        lease: Lease,
+        resource: Resource,
+        index: usize,
+        started: Instant,
+        results: async_channel::Sender<FetchResult<Vec<u8>>>,
+        attempts: u32,
+    ) {
+        let host = host_of(&resource.url).unwrap_or_default();
+        let exit_key = lease.key();
+        let pol = self.shared.policy();
+        self.shared.egress.record_slim_challenge(
+            &exit_key,
+            &host,
+            pol.transient_cooldown,
+            pol.burn_cooldown,
+        );
+        lease.release(ExitStatus::Cooled);
+        self.resolve_challenge(exit_key, resource, index, started, results, attempts)
+            .await;
+    }
+
+    /// The shared challenge ladder, after the exit has already been released by the caller: retry
+    /// slim while the rotation budget lasts, escalate to a headed fetch once it's spent (if the
+    /// fingerprint triple is trustworthy), or give up (`FingerprintMismatch`, or `MisconfiguredHost`
+    /// once the domain is confirmed structurally broken). Two callers with different exit dispositions
+    /// share this: a live challenge (`challenged`, exit cooled) and a redirect-suspect no-clearance
+    /// pull (`serve_html`, exit released `Ok` — its brokenness is domain-wide, not the exit's).
+    async fn resolve_challenge(
+        &self,
+        exit_key: String,
+        resource: Resource,
+        index: usize,
+        started: Instant,
+        results: async_channel::Sender<FetchResult<Vec<u8>>>,
+        attempts: u32,
+    ) {
+        let host = host_of(&resource.url).unwrap_or_default();
+        let escalate_allowed =
+            self.shared.fingerprint_ok || self.shared.slim_ever_succeeded.load(Ordering::Relaxed);
+        let left = attempts.saturating_sub(1);
+        let misconfigured = self.shared.confirmed_misconfigured(&host);
+        match ladder::decide_challenge(escalate_allowed, left, misconfigured.is_some()) {
+            ChallengeAction::RetrySlim => {
+                tracing::debug!("clearance challenged · re-warming and retrying slim");
+                self.requeue(Job::Html {
+                    resource,
+                    index,
+                    started,
+                    results,
+                    attempts: left,
+                })
+                .await;
+            }
+            ChallengeAction::Escalate => {
+                tracing::info!(
+                    "clearance challenged past the budget · escalating to a headed fetch"
+                );
+                self.requeue(self.escalate_to_headed(resource, index, started, results))
+                    .await;
+            }
+            ChallengeAction::GiveUp => {
+                let label = exit_label(&exit_key);
+                let err = replay_giveup(&self.shared, Reason::Challenged, label);
+                self.deliver(index, &resource, &results, Err(err)).await;
+            }
+            ChallengeAction::GiveUpMisconfigured => {
+                let landed = misconfigured.unwrap_or_default();
+                tracing::error!(
+                    configured = host,
+                    landed,
+                    "gave up — domain confirmed misconfigured (solve keeps redirecting to a host \
+                     that never validates)"
+                );
+                let err = FetchError::MisconfiguredHost { host, landed };
+                self.deliver(index, &resource, &results, Err(err)).await;
+            }
+        }
     }
 
     /// Apply an **exit-quality** slim failure (5xx/timeout/rate-limit, or a *raw*-host challenge) to
@@ -628,7 +890,8 @@ impl Worker {
                     Fail::Requeue { attempts: left }
                 } else {
                     tracing::error!(
-                        "raw challenged on every exit · register the host as a solve domain"
+                        "raw challenged on every exit · this host is configured raw but is \
+                         Cloudflare-protected — reconfigure it as a solve domain"
                     );
                     Fail::GiveUp(FetchError::GaveUp(Reason::Challenged))
                 }
@@ -660,6 +923,64 @@ impl Worker {
         let _ = self.retry_tx.send(job).await; // unbounded → immediate
     }
 
+    /// Turn a browser-free `Job::Html` into a **headed fetch of its own URL** — the escalation for a
+    /// slim challenge that a cookie can't clear (a per-URL CF challenge). The extractor solves headed
+    /// on some exit (`serve_headed_job`), waits for the page to settle, and delivers its HTML into
+    /// the *same* results slot, so escalation is invisible to the caller — just a slower, solved
+    /// fetch. Given its own rotation budget; a genuine dead end (the browser can't clear it either)
+    /// surfaces as `GaveUp`.
+    fn escalate_to_headed(
+        &self,
+        resource: Resource,
+        index: usize,
+        started: Instant,
+        results: async_channel::Sender<FetchResult<Vec<u8>>>,
+    ) -> Job {
+        let url = resource.url.clone();
+        let budget = self.shared.cfg.timeout;
+        let exec: HeadedExec = Box::new(move |res| {
+            Box::pin(async move {
+                let result = match res {
+                    Ok(session) => {
+                        let html = wait_full_load(&session.page, budget).await;
+                        // Don't blindly trust the clear: the page may have *settled into* a
+                        // rate-limit/block/challenge after the solve loop declared it cleared (e.g. a
+                        // post-clear 429). Re-run the same classifier the solve loop uses; on a
+                        // failure reason, give up rather than deliver an error page as a 200 (the
+                        // caller then defers it, not writes it). A content-shaped stub — a valid 200
+                        // that's just body-less — is not an error `classify` can see; that stays the
+                        // caller's content check.
+                        let title = page_title_of(&html);
+                        match crate::classify::from_page(&title, &html) {
+                            Some(reason) => Err(FetchError::GaveUp(reason)),
+                            None => Ok(Outcome {
+                                value: html.into_bytes(),
+                                clicks: session.clicks,
+                                elapsed: started.elapsed(),
+                                solve_required: true,
+                                exit: Some(session.exit),
+                            }),
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = results
+                    .send(FetchResult {
+                        index,
+                        url: resource.url,
+                        key: resource.key,
+                        result,
+                    })
+                    .await;
+            })
+        });
+        Job::Headed {
+            url,
+            exec,
+            attempts: self.shared.cfg.policy.max_attempts,
+        }
+    }
+
     async fn deliver(
         &self,
         index: usize,
@@ -675,27 +996,6 @@ impl Worker {
                 result,
             })
             .await;
-    }
-
-    async fn deliver_err(&self, job: Job, err: FetchError) {
-        match job {
-            Job::Html {
-                resource,
-                index,
-                results,
-                ..
-            } => {
-                let _ = results
-                    .send(FetchResult {
-                        index,
-                        url: resource.url,
-                        key: resource.key,
-                        result: Err(err),
-                    })
-                    .await;
-            }
-            Job::Headed { exec, .. } => exec(Err(err)).await,
-        }
     }
 
     // ── headed role (fetch_browser) ─────────────────────────────────────────────────────
@@ -772,7 +1072,12 @@ impl Worker {
         let profile = self.shared.persistence.profile_dir(exit_key);
         let artifacts = self.shared.persistence.artifact_dir();
         // A headed fetch the caller explicitly asked for gets the full --timeout budget.
-        let cfg = solve_config(&self.shared.cfg, &artifacts, self.shared.cfg.timeout);
+        let cfg = solve_config(
+            &self.shared.cfg,
+            &artifacts,
+            self.shared.cfg.timeout,
+            self.shared.chrome_exec.path().to_path_buf(),
+        );
         let mut browser = match Browser::launch(
             proxy.as_deref(),
             &profile,
@@ -783,7 +1088,7 @@ impl Worker {
         {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = %e, "browser launch failed");
+                tracing::warn!(error = ?e, "browser launch failed");
                 return Err(Reason::Unavailable);
             }
         };
@@ -796,7 +1101,8 @@ impl Worker {
                 clearance,
                 clicks,
             }) => {
-                self.record_solve(exit_key, &host_of(url).unwrap_or_default(), clearance);
+                let host = host_of(url).unwrap_or_default();
+                record_solve(&self.shared, exit_key, &host, clearance).await;
                 Ok((browser, page, clicks))
             }
             Err(reason) => {
@@ -807,37 +1113,6 @@ impl Worker {
     }
 
     // ── shared helpers ──────────────────────────────────────────────────────────────────
-
-    /// Bank a freshly-lifted clearance on the exit (surfacing any fingerprint drift first).
-    fn record_solve(&self, exit_key: &str, host: &str, clearance: Clearance) {
-        self.shared.egress.check_fingerprint(&clearance.user_agent);
-        self.shared
-            .egress
-            .record_clearance(exit_key, host, clearance);
-    }
-
-    async fn slim_request(
-        &self,
-        req: &Request,
-        exit_key: &str,
-        proxy: Option<&str>,
-        clearance: Option<&Clearance>,
-    ) -> Result<Vec<u8>, Reason> {
-        let started = Instant::now();
-        let result = match &self.shared.slim_override {
-            Some(f) => f(req.url.clone(), exit_key.to_string(), clearance.is_some()),
-            None => slim::fetch(&self.shared.slim_client(proxy)?, req, clearance).await,
-        };
-        if result.is_ok() {
-            self.shared
-                .egress
-                .record_success(exit_key, started.elapsed());
-            self.shared
-                .slim_ever_succeeded
-                .store(true, Ordering::Relaxed);
-        }
-        result
-    }
 
     fn outcome<T>(
         &self,
@@ -853,6 +1128,116 @@ impl Worker {
             elapsed: started.elapsed(),
             solve_required,
             exit: Some(label),
+        }
+    }
+}
+
+/// Send one slim request (replaying `clearance` if present), free-standing so both the serving
+/// worker's normal replay and a warm-time self-verify (see [`record_solve`]) share it. `host` is the
+/// domain key for the per-host challenge streak (`ExitPool::record_success`) — the request's own
+/// host for a normal replay, the configured host for a self-verify probe.
+async fn slim_request(
+    shared: &Arc<Shared>,
+    req: &Request,
+    exit_key: &str,
+    host: &str,
+    proxy: Option<&str>,
+    clearance: Option<&Clearance>,
+) -> Result<Vec<u8>, Reason> {
+    let started = Instant::now();
+    let result = match &shared.slim_override {
+        Some(f) => f(req.url.clone(), exit_key.to_string(), clearance.is_some()),
+        None => slim::fetch(&shared.slim_client(proxy)?, req, clearance).await,
+    };
+    if result.is_ok() {
+        shared
+            .egress
+            .record_success(exit_key, host, started.elapsed());
+        shared.slim_ever_succeeded.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+/// Bank a freshly-lifted clearance — but if the solve **redirected** to a different host than
+/// configured, don't trust it blindly: a stored clearance is what lets a serving worker claim real
+/// traffic for this domain, and slim replays against the *configured* host with no rewrite (see
+/// `slim::Request`'s docs), so a clearance scoped to the landed host may not actually validate there.
+/// Verify with one extra slim probe against the configured host before banking — cheap, and only
+/// paid in the rare redirect case. A harmless redirect (the probe succeeds) banks normally; a
+/// confirmed mismatch (the probe is challenged) is treated exactly like an ordinary solve-host
+/// challenge on this exit (drop it, bench with the escalating cooldown) *and*, when slim is
+/// independently known to work, counted toward the domain-level structural-misconfiguration signal
+/// (see [`Shared::note_redirect_mismatch`]) — the thing a single flaky exit could never prove on its
+/// own. Called by both the maintainer's warm loop and a headed escalation's own solve.
+async fn record_solve(shared: &Arc<Shared>, exit_key: &str, host: &str, clearance: Clearance) {
+    shared.egress.check_fingerprint(&clearance.user_agent);
+    if clearance.host.is_empty() || clearance.host == host {
+        // A clean solve on the configured host is the self-heal path when a site *stops*
+        // redirecting: clear any prior mismatch streak, else the domain stays wrongly flagged
+        // `MisconfiguredHost` forever (a redirected-then-verified solve heals via the Ok branch
+        // below — both banking paths must reset, or recovery-without-redirect never heals).
+        shared.reset_redirect_mismatch(host);
+        shared.egress.record_clearance(exit_key, host, clearance);
+        return;
+    }
+    let landed = clearance.host.clone();
+    tracing::warn!(
+        configured = host,
+        %landed,
+        "solve redirected to a different host; verifying the clearance against the configured host \
+         before trusting it as warm"
+    );
+    let proxy = (!exit_key.is_empty()).then(|| exit_key.to_string());
+    let verify = Request {
+        url: format!("https://{host}/"),
+        ..Default::default()
+    };
+    // Reuses the standard pooled slim client (its normal timeout, not a shortened one) — this is a
+    // rare path and a dedicated shorter-timeout client per proxy would duplicate the pool `slim_client`
+    // already bounds FDs with.
+    match slim_request(
+        shared,
+        &verify,
+        exit_key,
+        host,
+        proxy.as_deref(),
+        Some(&clearance),
+    )
+    .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                configured = host,
+                %landed,
+                "redirected clearance verified against the configured host — banking it"
+            );
+            shared.reset_redirect_mismatch(host);
+            shared.egress.record_clearance(exit_key, host, clearance);
+        }
+        Err(Reason::Challenged) => {
+            let pol = shared.policy();
+            shared.egress.record_slim_challenge(
+                exit_key,
+                host,
+                pol.transient_cooldown,
+                pol.burn_cooldown,
+            );
+            let trusted =
+                shared.fingerprint_ok || shared.slim_ever_succeeded.load(Ordering::Relaxed);
+            shared.note_redirect_mismatch(host, &landed, trusted);
+        }
+        Err(reason) => {
+            // Not a challenge, but the probe still failed to validate the redirected clearance
+            // against the configured host, so we can't bank it. Treat it like an untrusted
+            // mismatch: mark the domain unwarmable (so it can't hold the `may_pull` gate hostage and
+            // hang every *other* domain's workers) and back off re-warming — but never accuse it
+            // (`MisconfiguredHost` means a *challenge* that never clears, not a transient obstacle).
+            tracing::debug!(
+                configured = host,
+                ?reason,
+                "redirect self-verify inconclusive (non-challenge) — not banking; backing off warming"
+            );
+            shared.note_redirect_mismatch(host, &landed, false);
         }
     }
 }
@@ -873,10 +1258,12 @@ impl Maintainer {
             if self.closing.load(Ordering::Relaxed) {
                 return;
             }
-            let domains = self.shared.solve_domains();
+            let domains = self.shared.warmable_solve_domains();
             if domains.is_empty() {
-                // Pure-raw workload: nothing to warm. Wait for a (possibly runtime-registered)
-                // solve domain or a shutdown, cheaply.
+                // Either a pure-raw workload (nothing to warm) or every solve domain is currently
+                // backed off by a confirmed structural mismatch — either way, nothing to do right
+                // now. Wait for a (possibly runtime-registered) solve domain, a backoff lapsing, or
+                // a shutdown, cheaply.
                 let wake = leasable.notified();
                 tokio::pin!(wake);
                 wake.as_mut().enable();
@@ -930,7 +1317,13 @@ impl Maintainer {
         let span = tracing::info_span!("warm", code = %lease.code(), host = %host);
         async {
             self.shared.egress.mark_solving(&exit_key);
-            match self.solve(&url, &exit_key).await {
+            let solved = self.solve(&url, &exit_key).await;
+            // The browser solve is done and the browser closed — release the scarce B permit *now*,
+            // before `record_solve`. Its redirect self-verify is a plain slim probe (not a browser
+            // op) under the full slim timeout; holding B across it would let a few concurrently
+            // redirecting solves stall all catalog warming, defeating the short warm timeout.
+            drop(permit);
+            match solved {
                 Ok((clearance, clicks)) => {
                     tracing::info!(clicks, "warmed host in browser");
                     let how = if clicks > 0 {
@@ -938,7 +1331,7 @@ impl Maintainer {
                     } else {
                         "cleared".into()
                     };
-                    self.record_solve(&exit_key, host, clearance);
+                    record_solve(&self.shared, &exit_key, host, clearance).await;
                     self.shared.event(format!("{how} {host} via {label}"));
                     lease.release(ExitStatus::Ok); // idle, now warm — release wakes its worker
                 }
@@ -972,7 +1365,6 @@ impl Maintainer {
         }
         .instrument(span)
         .await;
-        drop(permit);
     }
 
     /// The warming solve: the injected fake in tests, else a real headed browser solve on the
@@ -988,6 +1380,7 @@ impl Maintainer {
             &self.shared.cfg,
             &artifacts,
             self.shared.cfg.policy.warm_timeout,
+            self.shared.chrome_exec.path().to_path_buf(),
         );
         let mut browser = match Browser::launch(
             proxy.as_deref(),
@@ -999,7 +1392,7 @@ impl Maintainer {
         {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!(error = %e, "browser launch failed");
+                tracing::warn!(error = ?e, "browser launch failed");
                 return Err(Reason::Unavailable);
             }
         };
@@ -1020,12 +1413,29 @@ impl Maintainer {
         browser.close().await;
         result
     }
+}
 
-    fn record_solve(&self, exit_key: &str, host: &str, clearance: Clearance) {
-        self.shared.egress.check_fingerprint(&clearance.user_agent);
-        self.shared
-            .egress
-            .record_clearance(exit_key, host, clearance);
+/// Deliver a terminal error into `job`'s own result slot — a `Job::Html`'s results channel, or a
+/// `Job::Headed`'s executor. Shared by a worker's dead-pool reap and `WorkerPool::submit`'s
+/// pre-flight rejection, since both fail a job before (or without) ever serving it.
+async fn deliver_err(job: Job, err: FetchError) {
+    match job {
+        Job::Html {
+            resource,
+            index,
+            results,
+            ..
+        } => {
+            let _ = results
+                .send(FetchResult {
+                    index,
+                    url: resource.url,
+                    key: resource.key,
+                    result: Err(err),
+                })
+                .await;
+        }
+        Job::Headed { exec, .. } => exec(Err(err)).await,
     }
 }
 
@@ -1085,6 +1495,30 @@ impl WorkerPool {
     }
 
     pub async fn submit(&self, job: Job) -> Result<(), FetchError> {
+        // Routing gate — the single choke point for *all* work, browser-free or headed (the
+        // feeder, `Client::fetch_browser`, and the test harness all submit here). Every fetched
+        // host must match a configured `Domain` (exact host, solve or raw); an unconfigured host
+        // is a caller error, not a silent raw fetch. Reject it into its own result slot *before*
+        // it enters the queue or leases an exit — a fast, deterministic failure independent of
+        // pool state.
+        let host = match &job {
+            Job::Html { resource, .. } => host_of(&resource.url).unwrap_or_default(),
+            Job::Headed { url, .. } => host_of(url).unwrap_or_default(),
+        };
+        let Some(domain) = self.shared.domain_for(&host) else {
+            deliver_err(job, FetchError::Unconfigured { host }).await;
+            return Ok(());
+        };
+        // A domain already confirmed structurally misconfigured (see `record_solve`'s
+        // self-verify): no exit will ever warm for it, so a job would otherwise queue forever (or,
+        // for a headed fetch, launch a browser doomed to fail every time). Same pre-flight spirit
+        // as `Unconfigured`.
+        if domain.solve
+            && let Some(landed) = self.shared.confirmed_misconfigured(&domain.host)
+        {
+            deliver_err(job, FetchError::MisconfiguredHost { host, landed }).await;
+            return Ok(());
+        }
         self.work_tx
             .send(job)
             .await
@@ -1118,7 +1552,12 @@ impl WorkerPool {
     }
 }
 
-fn solve_config(cfg: &Config, artifact_dir: &Path, timeout: Duration) -> SolveConfig {
+fn solve_config(
+    cfg: &Config,
+    artifact_dir: &Path,
+    timeout: Duration,
+    chrome: PathBuf,
+) -> SolveConfig {
     SolveConfig {
         real_display: cfg.real_display,
         cdp_click: cfg.cdp_click,
@@ -1131,7 +1570,17 @@ fn solve_config(cfg: &Config, artifact_dir: &Path, timeout: Duration) -> SolveCo
         height: cfg.height,
         capture_dir: cfg.capture_dir.clone(),
         artifact_dir: artifact_dir.to_path_buf(),
+        chrome,
     }
+}
+
+/// The `<title>` text of a settled page's HTML — enough for `classify::from_page` to spot a
+/// challenge/error title. Best-effort string scan (no HTML parser); empty if there's no title.
+fn page_title_of(html: &str) -> String {
+    html.split_once("<title>")
+        .and_then(|(_, rest)| rest.split_once("</title>"))
+        .map(|(title, _)| title.trim().to_string())
+        .unwrap_or_default()
 }
 
 pub(crate) fn exit_label(exit_key: &str) -> String {
@@ -1151,7 +1600,7 @@ fn exit_code_of(pool: &ExitPool, exit_key: &str) -> String {
         .unwrap_or_else(|| exit_label(exit_key))
 }
 
-/// The URL minus its scheme, for a compact `fetch` span field (`fragrantica.com/search/`).
+/// The URL minus its scheme, for a compact `fetch` span field (`example.com/search/`).
 fn short_url(url: &str) -> &str {
     url.strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))
@@ -1235,7 +1684,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    const RATE_HOST: &str = "test";
+    const RATE_HOST: &str = "h.test";
 
     fn fake_clearance() -> Clearance {
         Clearance::new(
@@ -1281,12 +1730,18 @@ mod tests {
             browser_permits,
             slim_clients: Mutex::new(HashMap::new()),
             slim_ever_succeeded: AtomicBool::new(false),
+            // Off in tests: escalation routes through the real-browser headed path (no fake seam),
+            // so tests that exercise a solve-host challenge rely on `slim_ever_succeeded` (an
+            // actual fake slim success) rather than this canary to trust their evidence.
+            fingerprint_ok: false,
+            chrome_exec: ChromeExec::direct("/usr/bin/true"),
             domains,
             aggregate_pacers: Mutex::new(HashMap::new()),
             shutdown: Arc::new(Notify::new()),
             solve_override: Some(solve),
             slim_override: Some(slim),
             req_counter: AtomicU64::new(0),
+            redirect_mismatches: Mutex::new(HashMap::new()),
         })
     }
 
@@ -1326,7 +1781,7 @@ mod tests {
         (0..n).map(|i| format!("e{i}")).collect()
     }
 
-    /// `*.test` hosts take the warm/solve path (the solve-set holds `"test"`, which suffix-matches).
+    /// `h.test` takes the warm/solve path (the solve-set holds `"h.test"`, matched exactly).
     fn cfg_with(browsers: usize) -> Config {
         Config {
             browsers,
@@ -1429,9 +1884,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn raw_host_is_served_without_any_solve() {
         let solves = Arc::new(AtomicUsize::new(0));
+        let mut cfg = raw_cfg(2);
+        cfg.domains = vec![Domain::raw("api.raw")];
         let shared = test_shared(
             codes(4),
-            raw_cfg(2),
+            cfg,
             counting_solve(solves.clone()),
             always_serves(),
         );
@@ -1457,9 +1914,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_challenged_exit_does_not_block_the_scrape() {
         let solves = Arc::new(AtomicUsize::new(0));
+        let mut cfg = raw_cfg(2);
+        cfg.domains = vec![Domain::raw("shop.io")];
         let shared = test_shared(
             codes(4),
-            raw_cfg(2),
+            cfg,
             counting_solve(solves.clone()),
             one_exit_challenges(),
         );
@@ -1480,11 +1939,83 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn unregistered_cf_host_gives_up_without_warming() {
+    async fn unconfigured_host_is_rejected_before_any_work() {
         let solves = Arc::new(AtomicUsize::new(0));
         let shared = test_shared(
             codes(4),
-            raw_cfg(2),
+            raw_cfg(2), // no domains — nothing is configured
+            counting_solve(solves.clone()),
+            warm_serves_cold_challenges(),
+        );
+        let out = run_batch(shared.clone(), vec!["https://shop.cf/p".into()]).await;
+
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(&out[0].result, Err(FetchError::Unconfigured { host }) if host == "shop.cf"),
+            "an unconfigured host fails Unconfigured up front — never silently fetched raw"
+        );
+        assert_eq!(
+            total_solves(&shared),
+            0,
+            "no exit was leased, no browser launched"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn headed_job_on_an_unconfigured_host_is_also_rejected_up_front() {
+        // `Job::Headed` (what `Client::fetch_browser` submits) must hit the same pre-flight gate
+        // as `Job::Html` — it used to fall straight through to the work queue, launching a browser
+        // on an unconfigured host instead of failing fast like the browser-free path.
+        let shared = test_shared(
+            codes(2),
+            raw_cfg(2), // no domains — nothing is configured
+            counting_solve(Arc::new(AtomicUsize::new(0))),
+            warm_serves_cold_challenges(),
+        );
+        let pool = WorkerPool::spawn(shared.clone());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let exec: HeadedExec = Box::new(move |res| {
+            Box::pin(async move {
+                let _ = tx.send(res);
+            })
+        });
+        pool.submit(Job::Headed {
+            url: "https://shop.cf/".into(),
+            exec,
+            attempts: 3,
+        })
+        .await
+        .unwrap();
+
+        match rx.await.unwrap() {
+            Err(FetchError::Unconfigured { host }) => assert_eq!(host, "shop.cf"),
+            other => panic!(
+                "a headed job on an unconfigured host must also fail Unconfigured up front, got {}",
+                match other {
+                    Ok(_) => "Ok(_)".to_string(),
+                    Err(e) => format!("Err({e:?})"),
+                }
+            ),
+        }
+        assert_eq!(
+            total_solves(&shared),
+            0,
+            "no exit was leased, no browser launched"
+        );
+        pool.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raw_host_that_is_actually_cf_gives_up_challenged() {
+        // Configured raw, but the origin is Cloudflare-protected (challenges every exit). The raw
+        // path can't solve, so the resource exhausts its rotation and gives up `Challenged` — the
+        // signal to reconfigure it as a solve domain.
+        let solves = Arc::new(AtomicUsize::new(0));
+        let mut cfg = raw_cfg(2);
+        cfg.domains = vec![Domain::raw("shop.cf")];
+        let shared = test_shared(
+            codes(4),
+            cfg,
             counting_solve(solves.clone()),
             warm_serves_cold_challenges(),
         );
@@ -1493,9 +2024,13 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(
             matches!(out[0].result, Err(FetchError::GaveUp(Reason::Challenged))),
-            "an unregistered CF host gives up Challenged — register it in solve_domains"
+            "a configured-raw host that is actually CF gives up Challenged"
         );
-        assert_eq!(total_solves(&shared), 0, "no browser was launched");
+        assert_eq!(
+            total_solves(&shared),
+            0,
+            "the raw path never launches a browser"
+        );
     }
 
     /// A solve that fails on one specific exit (`e1`) but succeeds elsewhere. Proves the
@@ -1605,5 +2140,170 @@ mod tests {
             matches!(out[0].result, Err(FetchError::FingerprintMismatch { .. })),
             "slim never serving despite fresh cookies is flagged as a fingerprint mismatch, not an endless loop"
         );
+    }
+
+    /// A solve that redirects to a different host, where the landed-host clearance still validates
+    /// fine against the *configured* host (a harmless redirect) — the self-verify should bank it
+    /// normally, exactly as an unredirected solve, with no domain flagged misconfigured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn harmless_redirect_is_verified_and_banked_normally() {
+        let solve: SolveFn = Arc::new(|_url, _exit| {
+            Box::pin(async {
+                Ok((
+                    Clearance::new(
+                        vec![("cf_clearance".into(), "t".into())],
+                        "UA".into(),
+                        None,
+                        "redirected.test".into(), // lands elsewhere, but the clearance still works
+                    ),
+                    0u32,
+                ))
+            })
+        });
+        let shared = test_shared(codes(4), cfg_with(4), solve, warm_serves_cold_challenges());
+        let urls: Vec<String> = (0..20).map(|i| format!("https://h.test/p{i}")).collect();
+        let out = run_batch(shared.clone(), urls).await;
+
+        assert_eq!(out.len(), 20);
+        assert!(
+            out.iter().all(|r| r.result.is_ok()),
+            "a harmless redirect still serves fine"
+        );
+        assert!(
+            shared.misconfigured_domains().is_empty(),
+            "a redirect whose clearance validates is never flagged misconfigured"
+        );
+    }
+
+    /// The structural-misconfiguration shape end to end: "bad.test"'s solve always redirects to a
+    /// host whose clearance never validates against "bad.test" (confirmed by the self-verify), while
+    /// "good.test" shares the same exit pool and works fine throughout. Proves: the domain gets
+    /// flagged (with the landed host, for the operator-facing summary), a job submitted afterward
+    /// fails **fast** with `MisconfiguredHost` rather than hanging or silently escalating to a real
+    /// browser forever, and the healthy domain is never affected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn structurally_misconfigured_domain_gives_up_fast_without_affecting_a_healthy_one() {
+        let solve: SolveFn = Arc::new(|url, _exit| {
+            Box::pin(async move {
+                if url.contains("bad.test") {
+                    Ok((
+                        Clearance::new(
+                            vec![("cf_clearance".into(), "t".into())],
+                            "UA".into(),
+                            None,
+                            "redirected.test".into(),
+                        ),
+                        0u32,
+                    ))
+                } else {
+                    Ok((fake_clearance(), 0u32))
+                }
+            })
+        });
+        let slim: SlimFn = Arc::new(|url, _exit, has_clearance| {
+            if url.contains("bad.test") {
+                Err(Reason::Challenged) // never validates, warm or not
+            } else if has_clearance {
+                Ok(b"<html>good</html>".to_vec())
+            } else {
+                Err(Reason::Challenged)
+            }
+        });
+
+        let mut cfg = cfg_with(4);
+        cfg.domains = vec![Domain::solve("good.test"), Domain::solve("bad.test")];
+        // Every exit's fake solve is instant, so — unlike a real run, where solves are staggered by
+        // real browser time — all exits can hit "bad.test"'s broken self-verify in lockstep and cool
+        // simultaneously (one cooldown per exit, not per domain, is deliberate — see CLAUDE.md).
+        // Shrink the cooldown so that harmless thundering-herd doesn't make the test slow.
+        cfg.policy.transient_cooldown = Duration::from_millis(2);
+        cfg.policy.burn_cooldown = Duration::from_millis(10);
+        // The domain-level backoff (once trust lands, escalating from `base`) would otherwise wait
+        // up to a minute between confirmations — shrink it so reaching the confirm threshold doesn't
+        // depend on winning a race against the first backoff window.
+        cfg.policy.redirect_mismatch_backoff_base = Duration::from_millis(2);
+        cfg.policy.redirect_mismatch_backoff_max = Duration::from_millis(10);
+        let shared = test_shared(codes(6), cfg, solve, slim);
+        let pool = WorkerPool::spawn(shared.clone());
+
+        // Drive a few "good.test" requests through so slim independently proves itself healthy —
+        // the gate (`fingerprint_ok || slim_ever_succeeded`) that lets a "bad.test" self-verify
+        // failure be trusted as domain-specific evidence rather than a possibly-broken fingerprint
+        // triple no fresh clearance could ever satisfy.
+        let (tx, rx) = async_channel::bounded(4);
+        for i in 0..4 {
+            pool.submit(Job::Html {
+                resource: Resource::from(format!("https://good.test/p{i}")),
+                index: i,
+                started: Instant::now(),
+                results: tx.clone(),
+                attempts: shared.cfg.policy.max_attempts,
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        let mut good_results = Vec::new();
+        while let Ok(fr) = rx.recv().await {
+            good_results.push(fr);
+        }
+        assert!(
+            good_results.iter().all(|r| r.result.is_ok()),
+            "the healthy domain serves fine throughout"
+        );
+
+        // Give the maintainer a chance to confirm "bad.test" is structurally broken. Polled rather
+        // than a fixed sleep to avoid flakiness while staying fast — it settles in ~milliseconds
+        // normally; the generous ceiling is headroom against a heavily contended test machine
+        // (many parallel tests' tokio runtimes competing for CPU), not the expected wait.
+        let confirmed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if shared
+                    .misconfigured_domains()
+                    .iter()
+                    .any(|(h, _)| h == "bad.test")
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            confirmed.is_ok(),
+            "bad.test should be confirmed misconfigured"
+        );
+        assert_eq!(
+            shared.misconfigured_domains(),
+            vec![("bad.test".to_string(), "redirected.test".to_string())],
+            "reports the landed host so the operator knows what to register instead"
+        );
+
+        // A job submitted *after* confirmation fails fast — no hang, no silent headed escalation.
+        let (tx2, rx2) = async_channel::bounded(1);
+        pool.submit(Job::Html {
+            resource: Resource::from("https://bad.test/p".to_string()),
+            index: 0,
+            started: Instant::now(),
+            results: tx2,
+            attempts: shared.cfg.policy.max_attempts,
+        })
+        .await
+        .unwrap();
+        let fr = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
+            .await
+            .expect("a confirmed-misconfigured domain must fail fast, not hang")
+            .unwrap();
+        assert!(
+            matches!(
+                &fr.result,
+                Err(FetchError::MisconfiguredHost { host, landed })
+                    if host == "bad.test" && landed == "redirected.test"
+            ),
+            "got {:?}",
+            fr.result.err()
+        );
+
+        pool.shutdown().await;
     }
 }

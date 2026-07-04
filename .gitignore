@@ -3,3 +3,4 @@
 spike-artifacts/
 /[0-9]*.json
 *.log
+.claude

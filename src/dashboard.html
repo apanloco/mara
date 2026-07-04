@@ -125,7 +125,7 @@
   table.exits td.warn { color: #ffb454; }
   table.exits tr.serving td, table.exits tr.solving td { background: #1a1430; }
   table.exits tr.serving td:first-child, table.exits tr.solving td:first-child { box-shadow: inset 3px 0 0 var(--in); }
-  table.exits tr.ready td:first-child, table.exits tr.warm td:first-child { box-shadow: inset 3px 0 0 #2a6b3a; }
+  table.exits tr.idle td:first-child { box-shadow: inset 3px 0 0 #2a6b3a; }
   table.exits tr.cooldown td:first-child, table.exits tr.rate-limited td:first-child { box-shadow: inset 3px 0 0 #6b561f; }
   table.exits tr.blocked td:first-child, table.exits tr.wonky td:first-child { box-shadow: inset 3px 0 0 #6b2230; }
   button.copy {
@@ -135,11 +135,10 @@
   }
   button.copy:hover { color: var(--fg); border-color: var(--accent); }
   .s-probing  { background:#173a52; color:#5bc0ff; }
-  .s-ready    { background:#11401f; color:#39d353; }
+  .s-idle     { background:#11401f; color:#39d353; }
   .s-serving  { background:#3a2a55; color:#c8a2ff; animation: pulse 1.4s infinite; }
   .s-solving  { background:#3a2a55; color:#c8a2ff; animation: pulse 1.4s infinite; }
-  .s-warm     { background:#13302a; color:#5fd0a8; }
-  .s-idle     { background:#11401f; color:#39d353; }
+  .s-cold     { background:#222a38; color:#8a97ad; }
   .s-paced    { background:#123038; color:#7fd6e0; }
   .s-slow     { background:#2b3850; color:#a9bbd6; }
   .s-wonky    { background:#4a1620; color:#ff6b81; }
@@ -323,6 +322,7 @@ function connect() {
     if (typeof ev.data !== "string") { onFrame(ev.data); return; }
     const msg = JSON.parse(ev.data);
     if (msg.type === "init") {
+      solvingActive = !!msg.solving;
       browsers.clear(); msg.browsers.forEach(b => browsers.set(b.id, b));
       ghosts.clear(); (msg.ghosts || []).forEach(g => ghosts.set(g.id, g));
       seedExits(msg.exits);
@@ -519,10 +519,12 @@ function cell(tr, cls) {
   return td;
 }
 
+let solvingActive = false;   // set from the init message: any solve domain registered → warming applies
+
 // Project the three orthogonal facets (activity, warmth + cooling, health — all now on one row)
 // to ONE honest badge: what it's doing now wins, then every reason it can't be leased, then the
-// leasable states. So `warm`/`ready` always mean "servable right now" — a warm-but-still-probing
-// exit reads `probing`, never a misleading `warm`.
+// leasable states. So `idle`/`cold` always mean "servable right now" — a warm-but-still-probing
+// exit reads `probing`, never a misleading leasable badge.
 function badgeOf(r) {
   const act = r.activity || "idle";
   const health = r.health || "ready";
@@ -532,23 +534,29 @@ function badgeOf(r) {
   if (r.over_latency) return "slow";        // probed over --max-exit-latency: not leasable
   if (health === "probing") return "probing";    // not yet probe-confirmed: not leasable, even if cleared
   if (r.paced) return "paced";                    // healthy, just spacing out under a per-IP rate ceiling
-  return "idle";                                  // leasable, doing nothing — WARMTH is the separate `cleared` axis
+  // Leasable and doing nothing. On a *solve* workload this splits by warmth, because the two mean
+  // opposite things: a warm exit is truly `idle` (free, nothing to do — a mid-run lull or end-of-run
+  // drain; the exit can't tell, only the job-progress strip knows if more work is coming), while an
+  // un-warm one isn't idle-by-choice — it *wants* work but must be warmed first (`cold`). On a
+  // pure-raw workload (no solve domains) warming doesn't apply, so an un-warm exit is just `idle`,
+  // never cold. `solvingActive` (from init) is what makes the distinction meaningful.
+  return (r.warm || !solvingActive) ? "idle" : "cold";
 }
-// Warmth (warm/cold) is deliberately NOT a badge: it's orthogonal to what an exit is doing (a
-// serving/paced/cooling exit can be warm or cold), so it lives on its own axis — the header's
-// `cleared N/total` count — not in this activity projection.
-const BADGE_LABEL = { solving: "warming", serving: "serving", "rate-limited": "rate-limited", slow: "too slow", idle: "idle" };
+// Warmth is NOT a badge for the *active* states — a serving/paced/cooling exit shows what it's
+// doing regardless of warmth (the header's `cleared N/total` is the full warm-store axis). It only
+// splits the leasable-idle badge, where `ready` (spare) vs `cold` (still warming) is the whole story.
+const BADGE_LABEL = { solving: "warming", serving: "serving", "rate-limited": "rate-limited", slow: "too slow" };
 
 // The single source of truth for badge precedence — used for the census order AND the row sort,
 // so the header, the table, and the badge can never disagree. Least-leasable first; `idle` (free
 // to lease, doing nothing) last.
-const BADGE_ORDER = ["solving", "serving", "blocked", "rate-limited", "cooldown", "wonky", "slow", "probing", "paced", "idle"];
+const BADGE_ORDER = ["solving", "serving", "blocked", "rate-limited", "cooldown", "wonky", "slow", "probing", "paced", "idle", "cold"];
 const BADGE_RANK = Object.fromEntries(BADGE_ORDER.map((b, i) => [b, i]));
 
 // The census strip (the activity axis — one slot per exit, sums to the total). CORE states are
 // always shown (even at zero) so the strip doesn't jump; `paced` is core so the pacing signal is
 // always visible. The rest appear only when an exit is actually in that state.
-const CENSUS_CORE = new Set(["solving", "serving", "paced", "probing", "idle"]);
+const CENSUS_CORE = new Set(["solving", "serving", "paced", "probing", "idle", "cold"]);
 const CENSUS_ORDER = BADGE_ORDER;
 
 function renderCensus(counts) {

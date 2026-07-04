@@ -13,7 +13,9 @@ use crate::egress::{Availability, ExitStatus, Lease};
 use crate::introspect::{ExitRow, Introspector};
 use crate::store::{Cooling, ExitData, Persistence, StoreSnapshot};
 
-/// Re-probe interval for a **confirmed** (`Ready`/`Wonky`) exit — an occasional re-confirm.
+/// Base re-probe interval for a **confirmed** exit — a healthy `Ready` re-confirm, and the first
+/// re-probe of a freshly-`Wonky` one. A persistently-failing `Wonky` exit backs off past this (see
+/// [`reprobe_after`]) so a dead relay goes quiet instead of retrying every minute forever.
 const REPROBE_AFTER: Duration = Duration::from_secs(60);
 /// Re-probe interval for an **unconfirmed** (`Probing`) exit — we're actively trying to confirm
 /// it, so retry fast instead of leaving a relay whose first probe failed (e.g. a startup-congestion
@@ -22,6 +24,18 @@ const PROBE_RETRY: Duration = Duration::from_secs(5);
 /// After this many consecutive failed probes, a still-`Probing` exit is demoted to `Wonky` — it's
 /// unreachable, not "being checked", so it leaves the probing bucket (and re-probes slowly).
 const PROBE_FAILS_TO_WONKY: u32 = 3;
+
+/// Re-probe backoff for a settled exit, keyed by consecutive probe failures. A `Ready` exit (0
+/// failures) and a just-demoted `Wonky` one re-confirm at [`REPROBE_AFTER`]; each further failure
+/// climbs `60s → 120s → 300s (cap)` so a persistently-dead relay stops soaking a re-probe every
+/// minute. The counter resets on any reachable/too-slow probe, so a flapping exit springs back.
+fn reprobe_after(probe_failures: u32) -> Duration {
+    match probe_failures.saturating_sub(PROBE_FAILS_TO_WONKY) {
+        0 => REPROBE_AFTER,
+        1 => Duration::from_secs(120),
+        _ => Duration::from_secs(300),
+    }
+}
 /// Probe connect-timeout when no latency cap is set (any latency is acceptable, so wait a while
 /// to confirm reachability). With a cap, the timeout is the cap instead — see [`connect_probe_for`].
 const PROBE_TIMEOUT_UNCAPPED: Duration = Duration::from_secs(5);
@@ -147,12 +161,13 @@ impl Exit {
     fn due(&self, now: Instant) -> bool {
         match self.data.cooling_until() {
             Some(until) => now >= until,
-            // An unconfirmed (`Probing`) exit retries fast; a settled one re-confirms slowly.
+            // An unconfirmed (`Probing`) exit retries fast; a settled one re-confirms slowly, a
+            // persistently-`Wonky` one backing off further the longer it stays unreachable.
             None => {
                 let interval = if self.health == ExitHealth::Probing {
                     PROBE_RETRY
                 } else {
-                    REPROBE_AFTER
+                    reprobe_after(self.probe_failures)
                 };
                 self.last_probe
                     .is_none_or(|t| now.duration_since(t) >= interval)
@@ -603,8 +618,8 @@ impl ExitPool {
         self.update_exit(key, false, |e| e.data.record_request());
     }
 
-    pub fn record_success(&self, key: &str, latency: Duration) {
-        self.update_exit(key, false, |e| e.data.record_success(latency));
+    pub fn record_success(&self, key: &str, host: &str, latency: Duration) {
+        self.update_exit(key, false, |e| e.data.record_success(host, latency));
     }
 
     pub fn record_clearance(&self, key: &str, host: &str, clearance: Clearance) {
@@ -1445,6 +1460,32 @@ mod tests {
             !ready.due(now),
             "a confirmed exit waits the full REPROBE_AFTER (60s)"
         );
+    }
+
+    #[test]
+    fn a_persistently_wonky_exit_backs_off_its_reprobe() {
+        let now = Instant::now();
+        // A just-demoted wonky exit (failures == PROBE_FAILS_TO_WONKY) still re-probes at 60s...
+        let mut fresh = ex("f", None, ExitHealth::Wonky, Activity::Idle, None);
+        fresh.probe_failures = PROBE_FAILS_TO_WONKY;
+        fresh.last_probe = Some(now - Duration::from_secs(90));
+        assert!(fresh.due(now), "fresh wonky re-probes after 60s");
+
+        // ...but as failures pile up it backs off past 60s and then to the 300s cap.
+        let mut stale = ex("s", None, ExitHealth::Wonky, Activity::Idle, None);
+        stale.probe_failures = PROBE_FAILS_TO_WONKY + 1;
+        stale.last_probe = Some(now - Duration::from_secs(90));
+        assert!(
+            !stale.due(now),
+            "one more failure pushes the interval to 120s"
+        );
+
+        let mut dead = ex("d", None, ExitHealth::Wonky, Activity::Idle, None);
+        dead.probe_failures = PROBE_FAILS_TO_WONKY + 5;
+        dead.last_probe = Some(now - Duration::from_secs(240));
+        assert!(!dead.due(now), "a long-dead relay waits the 300s cap");
+        dead.last_probe = Some(now - Duration::from_secs(300));
+        assert!(dead.due(now), "and re-probes once the 300s cap elapses");
     }
 
     #[test]

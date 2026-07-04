@@ -2,7 +2,7 @@ mod decrypt;
 mod parse;
 
 use anyhow::{Context, Result};
-use mara::{Client, Config};
+use mara::{Client, Config, Domain};
 use parse::{ProsCon, SimilarPerfume};
 use std::time::Duration;
 
@@ -41,9 +41,12 @@ async fn main() -> Result<()> {
     let (id, slug) = parse::parse_perfume_href(&path)
         .context("URL is not a /perfume/<Brand>/<Name>-<id>.html link")?;
 
+    let host = mara::host_of(&url).context("URL has no host")?;
+
     let client = Client::new(Config {
         exits,
         mullvad,
+        domains: vec![Domain::solve(host)],
         ..Default::default()
     })
     .await?;

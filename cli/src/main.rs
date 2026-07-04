@@ -11,7 +11,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "mara", about = "Cloudflare-clearing scraper")]
+#[command(
+    name = "mara",
+    about = "A scraper that clears challenges over a rotating pool of egress IPs"
+)]
 struct Cli {
     /// Log verbosity for mara's own crates (dependencies stay quiet). `RUST_LOG`, if set,
     /// overrides this entirely.
@@ -45,8 +48,51 @@ impl Verbosity {
 #[derive(Subcommand)]
 enum Cmd {
     Fetch(FetchArgs),
+    Warm(WarmArgs),
     Capture(CaptureArgs),
     Doctor,
+}
+
+/// Pre-warm the exit pool for one or more Cloudflare hosts: solve once per exit to bank a
+/// `cf_clearance`, so a later `fetch` (sharing the same `--data-dir`/`MARA_DATA_DIR`) replays
+/// browser-free from request #1. Best-effort — an exit that can't clear (unreachable, or a
+/// CF-flagged IP whose challenge never settles) is left cold; warming reports how many made it.
+#[derive(clap::Args)]
+struct WarmArgs {
+    /// Hosts/URLs to warm. Each host is registered as a solve domain (warmth is per-host, so a
+    /// bare host works — no path needed). Matched exactly — warm `www.example.com` and
+    /// `example.com` separately if you fetch both.
+    urls: Vec<String>,
+    /// Concurrent live browsers = concurrent solves (a machine-load guard). Clamped to catalog size.
+    #[arg(short = 'b', long, default_value_t = 4)]
+    browser_concurrency: usize,
+    #[arg(long = "exit")]
+    exits: Vec<String>,
+    #[arg(long)]
+    mullvad: bool,
+    /// Skip exits whose probed latency exceeds this (ms). Off by default.
+    #[arg(long, value_name = "MS")]
+    max_exit_latency: Option<u64>,
+    /// How many exits to health-probe concurrently (default 64).
+    #[arg(long, value_name = "N")]
+    probe_concurrency: Option<usize>,
+    /// Per-solve timeout in seconds.
+    #[arg(long, default_value_t = 60)]
+    timeout: u64,
+    /// Persist banked clearances here. Falls back to `MARA_DATA_DIR`; without either, warming is
+    /// in-memory only (pointless once the process exits — set one).
+    #[arg(long, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
+    /// Stop once the warm count hasn't grown for this many seconds — the maintainer has warmed
+    /// every reachable exit and is only retrying benched ones.
+    #[arg(long, value_name = "SECS", default_value_t = 20)]
+    settle: u64,
+    /// Hard cap: stop after this many seconds regardless (safety net; 0 = no cap).
+    #[arg(long, value_name = "SECS", default_value_t = 600)]
+    max_wait: u64,
+    /// After warming, keep the engine + dashboard alive until interrupted (inspect the pool).
+    #[arg(long)]
+    serve: bool,
 }
 
 #[derive(clap::Args)]
@@ -120,6 +166,7 @@ async fn main() -> Result<()> {
     init_tracing(cli.verbose);
     match cli.cmd {
         Cmd::Fetch(a) => fetch(a).await,
+        Cmd::Warm(a) => warm(a).await,
         Cmd::Capture(a) => capture(a).await,
         Cmd::Doctor => doctor().await,
     }
@@ -143,14 +190,13 @@ fn init_tracing(verbose: Verbosity) {
         .init();
 }
 
-/// Interrupt handler for Ctrl-C / SIGTERM. Chrome is spawned by chromiumoxide with no
-/// `PR_SET_PDEATHSIG`, and Rust destructors don't run on a signal, so a plain signal-killed `mara`
-/// orphans every in-flight browser (→ runaway Chrome processes). So we can't just exit — but we
-/// also don't want the *graceful* `shutdown()`, which drains the whole in-flight batch first
-/// (a Ctrl-C that "keeps working"). Instead `abort()` kills the browsers (aborting the workers
-/// drops their `Browser`s → `kill_on_drop` `SIGKILL`s Chrome) and abandons everything else, then we
-/// exit — a normal-feeling, near-instant interrupt with no orphans. A second signal hard-exits in
-/// case `abort` itself wedges. SIGKILL is uncatchable and remains the one case that can leak.
+/// Interrupt handler for Ctrl-C / SIGTERM. Orphaned Chrome is *already* prevented at the kernel
+/// level — every browser runs under `PR_SET_PDEATHSIG(SIGKILL)` (see `ChromeExec`), so even a
+/// SIGKILL of `mara` reaps them. This handler is the *tidy* path on top: rather than the graceful
+/// `shutdown()` (which drains the whole in-flight batch — a Ctrl-C that "keeps working"), `abort()`
+/// kills the browsers now (aborting the workers drops their `Browser`s → `kill_on_drop`) and
+/// abandons everything else, for a near-instant interrupt. A second signal hard-exits in case
+/// `abort` itself wedges — and PDEATHSIG still cleans up the browsers on that exit.
 fn shutdown_on_signal(client: Client) {
     use tokio::signal::unix::{SignalKind, signal};
     tokio::spawn(async move {
@@ -199,17 +245,186 @@ async fn doctor() -> Result<()> {
     }
 }
 
-async fn capture(args: CaptureArgs) -> Result<()> {
-    let url = if args.url.contains("://") {
-        args.url
+/// Surface any domain confirmed structurally misconfigured (solve keeps redirecting to a host that
+/// never validates) — the same spirit as the "N could not clear" summary, but actionable without
+/// needing `-v debug` to have caught the underlying warning.
+fn warn_misconfigured(client: &Client) {
+    for (host, landed) in client.misconfigured_domains() {
+        eprintln!(
+            "⚠ {host} looks misconfigured — solve keeps redirecting to {landed}, whose clearance \
+             never validates against {host}; register {landed} as its own host instead"
+        );
+    }
+}
+
+/// Bare hosts (no `://`) are assumed `https` — lets `mara fetch example.com` / `mara warm
+/// example.com` work without a full URL, as the help text advertises.
+fn normalize_url(u: &str) -> String {
+    if u.contains("://") {
+        u.to_string()
     } else {
-        format!("https://{}", args.url)
+        format!("https://{u}")
+    }
+}
+
+async fn warm(args: WarmArgs) -> Result<()> {
+    let mut hosts: Vec<String> = args
+        .urls
+        .iter()
+        .filter_map(|u| mara::host_of(&normalize_url(u)))
+        .collect();
+    hosts.sort();
+    hosts.dedup();
+    if hosts.is_empty() {
+        eprintln!("no hosts given — warm needs at least one Cloudflare host to warm exits for.");
+        return Ok(());
+    }
+
+    let browsers = args.browser_concurrency.max(1);
+    let mut policy = mara::Policy::default();
+    if let Some(pc) = args.probe_concurrency {
+        policy.probe_concurrency = pc.max(1);
+    }
+    let domains: Vec<mara::Domain> = hosts.iter().cloned().map(mara::Domain::solve).collect();
+    let client = Client::new(Config {
+        browsers,
+        exits: args.exits.clone(),
+        mullvad: args.mullvad,
+        domains,
+        policy,
+        max_latency: args.max_exit_latency.map(Duration::from_millis),
+        timeout: Duration::from_secs(args.timeout),
+        data_dir: args.data_dir.clone(),
+        ..Default::default()
+    })
+    .await
+    .context("building client")?;
+    shutdown_on_signal(client.clone());
+
+    let total = client.worker_count();
+    eprintln!(
+        "warming {} host(s) [{}] over {total} exit(s) | browsers(b)={browsers} | egress={}",
+        hosts.len(),
+        hosts.join(", "),
+        if args.mullvad {
+            "mullvad pool".to_string()
+        } else if args.exits.is_empty() {
+            "direct".to_string()
+        } else {
+            format!("{} manual exit(s)", args.exits.len())
+        },
+    );
+
+    // The maintainer warms the catalog fastest-first with no jobs submitted; we only watch. Warming
+    // is "done" once the warm count *and* the total solve count both stop growing for `settle`s —
+    // every reachable exit has been solved, and the rest are benched/unreachable (tried, can't
+    // clear). A warmup floor keeps an early poll from calling it done before the first solves land;
+    // `max_wait` is the hard safety net.
+    let settle = Duration::from_secs(args.settle.max(1));
+    let warmup_floor = Duration::from_secs(15);
+    let max_wait = (args.max_wait > 0).then(|| Duration::from_secs(args.max_wait));
+
+    // An exit counts as "warm" only once it holds a non-stale clearance for *every* requested host.
+    // The per-exit `ExitStatsInfo::warm` flag is coarser ("warm for ≥1 host") — it overclaims the
+    // moment more than one host is being warmed, and can even read warm off an unrelated host's
+    // leftover clearance in a persistent `--data-dir`. The clearances table is the per-host truth.
+    let count_warm = |s: &mara::store::StoreSnapshot| -> usize {
+        let fresh: std::collections::HashSet<(&str, &str)> = s
+            .clearances
+            .iter()
+            .filter(|c| !c.stale)
+            .map(|c| (c.exit_key.as_str(), c.host.as_str()))
+            .collect();
+        s.stats
+            .iter()
+            .filter(|e| {
+                hosts
+                    .iter()
+                    .all(|h| fresh.contains(&(e.exit_key.as_str(), h.as_str())))
+            })
+            .count()
     };
+    let count_solves =
+        |s: &mara::store::StoreSnapshot| -> u64 { s.stats.iter().map(|e| e.stats.solves).sum() };
+
+    let start = tokio::time::Instant::now();
+    let mut last_progress = start;
+    let (mut best_warm, mut best_solves) = (0usize, 0u64);
+    let mut last_shown = usize::MAX;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let snap = client.snapshot();
+        let (warm, solves) = (count_warm(&snap), count_solves(&snap));
+        if warm > best_warm || solves > best_solves {
+            best_warm = best_warm.max(warm);
+            best_solves = best_solves.max(solves);
+            last_progress = tokio::time::Instant::now();
+        }
+        if warm != last_shown {
+            let cooling = snap.stats.iter().filter(|e| e.cooling).count();
+            eprintln!("  {warm}/{total} warm  (cooling {cooling})");
+            last_shown = warm;
+        }
+        let idle = last_progress.elapsed();
+        if (start.elapsed() >= warmup_floor && idle >= settle)
+            || max_wait.is_some_and(|cap| start.elapsed() >= cap)
+        {
+            break;
+        }
+    }
+
+    let snap = client.snapshot();
+    let warm = count_warm(&snap);
+    let cold = total.saturating_sub(warm);
+    eprintln!(
+        "\n═══ warmed {warm}/{total} · {cold} could not clear · solves {} ═══",
+        count_solves(&snap),
+    );
+    if hosts.len() > 1 {
+        for h in &hosts {
+            let n = snap
+                .clearances
+                .iter()
+                .filter(|c| &c.host == h && !c.stale)
+                .count();
+            eprintln!("  {h}: {n} exit(s)");
+        }
+    }
+    warn_misconfigured(&client);
+
+    if args.serve {
+        eprintln!(
+            "\nengine + dashboard alive — open the `introspect dashboard` URL logged above; Ctrl-C to exit."
+        );
+        std::future::pending::<()>().await;
+    }
+
+    if tokio::time::timeout(Duration::from_secs(30), client.shutdown())
+        .await
+        .is_err()
+    {
+        eprintln!("⚠ shutdown timed out after 30s; exiting anyway");
+    }
+    Ok(())
+}
+
+async fn capture(args: CaptureArgs) -> Result<()> {
+    let url = normalize_url(&args.url);
+    // `fetch_browser` is a headed fetch, gated by the same exact-match `Domain` routing as the
+    // browser-free path — register the target so the call doesn't fail `Unconfigured`. `raw`, not
+    // `solve`: `Job::Headed` only needs a matching `Domain` to exist, and a `solve` entry would
+    // also enter the maintainer's warm-list, spending a browser permit and writing frames into
+    // `args.out` for a background solve capture never asked for.
+    let domains = mara::host_of(&url)
+        .into_iter()
+        .map(mara::Domain::raw)
+        .collect();
     let client = Client::new(Config {
         browsers: 1,
         exits: args.exits,
         mullvad: args.mullvad,
         capture_dir: Some(args.out.clone()),
+        domains,
         ..Default::default()
     })
     .await?;
@@ -234,17 +449,7 @@ async fn capture(args: CaptureArgs) -> Result<()> {
 }
 
 async fn fetch(args: FetchArgs) -> Result<()> {
-    let urls: Vec<String> = args
-        .urls
-        .iter()
-        .map(|u| {
-            if u.contains("://") {
-                u.clone()
-            } else {
-                format!("https://{u}")
-            }
-        })
-        .collect();
+    let urls: Vec<String> = args.urls.iter().map(|u| normalize_url(u)).collect();
     let work: Vec<String> = (0..args.repeat.max(1))
         .flat_map(|_| urls.iter().cloned())
         .collect();
@@ -269,30 +474,26 @@ async fn fetch(args: FetchArgs) -> Result<()> {
     // (warm/solve/replay). `--raw` opts out (non-CF targets: an API call, an image) so they ride
     // the exit pool browser-free. Unknown CF hosts that aren't registered just give up Challenged.
     let (per_ip, aggregate) = (args.rate, args.aggregate_rate);
-    let domains: Vec<mara::Domain> = if args.raw && per_ip.is_none() && aggregate.is_none() {
-        Vec::new() // pure raw, no pacing → nothing to configure
-    } else {
-        let mut hosts: Vec<String> = urls.iter().filter_map(|u| mara::host_of(u)).collect();
-        hosts.sort();
-        hosts.dedup();
-        hosts
-            .into_iter()
-            .map(|h| {
-                let mut d = if args.raw {
-                    mara::Domain::raw(h)
-                } else {
-                    mara::Domain::solve(h)
-                };
-                if let Some(n) = per_ip {
-                    d = d.per_ip(n);
-                }
-                if let Some(n) = aggregate {
-                    d = d.aggregate(n);
-                }
-                d
-            })
-            .collect()
-    };
+    let mut hosts: Vec<String> = urls.iter().filter_map(|u| mara::host_of(u)).collect();
+    hosts.sort();
+    hosts.dedup();
+    let domains: Vec<mara::Domain> = hosts
+        .into_iter()
+        .map(|h| {
+            let mut d = if args.raw {
+                mara::Domain::raw(h)
+            } else {
+                mara::Domain::solve(h)
+            };
+            if let Some(n) = per_ip {
+                d = d.per_ip(n);
+            }
+            if let Some(n) = aggregate {
+                d = d.aggregate(n);
+            }
+            d
+        })
+        .collect();
     let client = Client::new(Config {
         browsers,
         exits: args.exits.clone(),
@@ -398,7 +599,15 @@ async fn fetch(args: FetchArgs) -> Result<()> {
                     html_out = Some(out.value);
                 }
             }
-            Err(e) => eprintln!("  ✗ {i}  {url}  {e:#}"),
+            Err(e) => {
+                eprintln!("  ✗ {i}  {url}  {e:#}");
+                if e.is_config_error() {
+                    eprintln!(
+                        "✗ config error — aborting the batch (every remaining request would fail the same way)"
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -448,6 +657,7 @@ async fn fetch(args: FetchArgs) -> Result<()> {
                 sum(|s| s.timeouts),
             );
         }
+        warn_misconfigured(&client);
     }
 
     if let Some(html) = html_out {

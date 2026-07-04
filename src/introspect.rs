@@ -91,6 +91,11 @@ pub struct Introspector {
     progress: Mutex<Option<JobProgress>>,
     progress_tx: broadcast::Sender<JobProgress>,
     mullvad_required: std::sync::atomic::AtomicBool,
+    /// Whether any solve domain is registered — i.e. whether warming applies at all. Drives the
+    /// census `idle` vs `cold` split: only a *solve* workload has exits "waiting to be warmed"
+    /// (`cold`); on a pure-raw workload an un-warm leasable exit is just `idle` (available), never
+    /// cold. Latches true on the first solve-domain registration (startup or runtime).
+    solving: std::sync::atomic::AtomicBool,
     server: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -156,6 +161,7 @@ impl Introspector {
             progress: Mutex::new(None),
             progress_tx: broadcast::channel(16).0,
             mullvad_required: std::sync::atomic::AtomicBool::new(false),
+            solving: std::sync::atomic::AtomicBool::new(false),
             server: Mutex::new(None),
         })
     }
@@ -178,6 +184,14 @@ impl Introspector {
 
     pub fn set_mullvad_required(&self, required: bool) {
         self.mullvad_required.store(required, Ordering::Relaxed);
+    }
+
+    /// Latch that a solve domain is registered, so the dashboard splits leasable-idle exits into
+    /// `idle` (warm/free) vs `cold` (waiting to warm). Left false on a pure-raw workload.
+    pub fn set_solving(&self, solving: bool) {
+        if solving {
+            self.solving.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Publish a `fetch_all` batch's latest progress (the driver throttles how often it calls
@@ -313,6 +327,7 @@ impl Introspector {
     fn state_json(&self) -> serde_json::Value {
         serde_json::json!({
             "mullvad_required": self.mullvad_required.load(Ordering::Relaxed),
+            "solving": self.solving.load(Ordering::Relaxed),
             "tls_profile": crate::slim::PROFILE,
             "browsers": self.all(),
             "exits": self.exit_rows(),
@@ -524,6 +539,7 @@ async fn dashboard_socket(socket: WebSocket, intro: Arc<Introspector>) {
 
     let init = serde_json::json!({
         "type": "init",
+        "solving": intro.solving.load(Ordering::Relaxed),
         "browsers": intro.all(),
         "exits": intro.exit_rows(),
         "ghosts": intro.ghosts_json(),

@@ -36,6 +36,9 @@ pub struct SolveConfig {
     pub height: u32,
     pub capture_dir: Option<PathBuf>,
     pub artifact_dir: PathBuf,
+    /// The executable to launch — the `setpriv --pdeathsig` wrapper (or Chrome directly). See
+    /// [`crate::solver::session::ChromeExec`].
+    pub chrome: PathBuf,
 }
 
 pub struct Browser {
@@ -369,6 +372,7 @@ async fn launch_session(
         proxy,
         width: cfg.width,
         height: cfg.height,
+        chrome: &cfg.chrome,
     })
     .await
 }

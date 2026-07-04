@@ -37,19 +37,21 @@ replay browser-free" is the general model — Cloudflare is just the only challe
 wired up so far.
 
 **Whether a host is solved is a property of the host, not the request**, and
-**routing is fixed, not auto-detected.** Configured `Config.domains`
-(longest-suffix-matched, so a domain covers its subdomains) carry
-`{ host, solve, per_ip, aggregate }` (rates in req/min). A host matching a
-`solve` domain takes the warm/solve/replay path; **every other host is fetched
-raw** — lease any healthy exit, send as-is, no browser, but still rotate + cool
-down on 429/block. Declare CF hosts in `solve_domains` (or
-`Client::enable_solving_for_domain`); everything else is raw. A `raw` domain
-entry is routing-identical to an unregistered host — it exists only to hang
-per-host pacing (or to carve a raw exception out of a broader `solve` suffix).
+**routing is fully explicit, exact-matched, and not auto-detected.** Every host
+you fetch **must** be declared in `Config.domains` — `{ host, solve, per_ip,
+aggregate }` (rates in req/min), keyed by **exact host** (no suffix fallback:
+`example.com` does **not** cover `www.example.com` — register the precise
+host). A `solve` host takes the warm/solve/replay path; a `raw` host is fetched
+over the pool as-is (no browser, but still rotate + cool down on 429/block).
+Declare CF hosts via `Domain::solve` / `solve_domains` /
+`Client::enable_solving_for_domain`, and non-CF hosts via `Domain::raw`. There is
+**no silent raw default**: a host with no exact match fails **`Unconfigured`**
+immediately, before any exit is leased — never a guessed route, never a silent
+rewrite of the request onto another host.
 
-The `fetch` CLI inverts this default: being a page fetcher, it registers each
-target host as a `solve` domain, so `mara fetch <cf-url>` clears CF with no
-flags. `--raw` opts back out for non-CF targets (an API call, an image) so they
+The `fetch` CLI configures automatically: being a page fetcher, it registers each
+target host as a `solve` domain, so `mara fetch <cf-url>` clears CF with no flags.
+`--raw` registers the targets as `raw` instead (an API call, an image) so they
 ride the pool browser-free.
 
 There is deliberately **no auto-promotion** of a host onto the warm path: a host
@@ -57,13 +59,39 @@ you *know* is CF should replay persisted clearances from request #1 rather than
 waste a cookieless probe, and a single challenged exit must never flip a whole
 host mid-run and stall a fast run.
 
-Failure modes are local: an **unregistered CF host gives up `Challenged`** (raw
-can't solve — register it), and **no single challenged exit can affect the host
-or any other request**. On the raw path a challenge flags *that IP*: mara benches
-it briefly and rotates to a clean exit; only when a request's own rotation is
-exhausted with every tried exit challenged does that *one request* give up.
-Leave non-CF traffic (an API POST, an image GET) unregistered so it rides the
-pool browser-free.
+**A solve can land on a different host than configured** (an apex→`www`
+redirect, a regional bounce) — real, and previously papered over by silently
+rewriting the replay target onto the landed host; that rewrite is gone (above:
+never a silent rewrite), so a redirected solve is **self-verified** before
+being trusted warm: one extra slim probe against the *configured* host with the
+freshly-lifted clearance. A harmless redirect (the probe validates) banks
+exactly as if there'd been no redirect, and clears any prior mismatch streak —
+the self-heal path when a site *stops* redirecting. **Any** self-verify failure
+— challenged or not, trusted or not — excludes the domain from the serving
+warmth gate (so a domain that can never warm can't stall every *other* domain
+waiting on warmth that's never coming) *and* backs the maintainer off re-warming
+it, on an escalating, domain-scoped cooldown — tunable via `Policy` like the
+exit-level ones, but reaching a far longer ceiling, since this is a config
+problem, not exit noise. That backoff needs **no** trust: re-solving in a
+browser fixes neither a config error nor a broken pin, so a domain that never
+validates must not be re-solved on loop no matter which failure it hit. A
+**confirmed mismatch** — the probe is *also challenged*, corroborated by
+independently-healthy slim elsewhere (`fingerprint_ok` or an empirical slim
+success, ruling out a broken Chrome↔TLS↔UA pin as the real cause) —
+*additionally* marks the **domain**, not the exit, structurally misconfigured:
+requests targeting it give up fast with `MisconfiguredHost` (naming the landed
+host) instead of quietly escalating every request to a headed solve forever.
+`fetch`/`warm`'s own summary names any such domain, so the fix (register the
+landed host as its own domain) doesn't need `-v debug` to find.
+
+Failure modes are local. An **unconfigured host gives up `Unconfigured`** up
+front (register it — solve or raw). A host configured **raw** that turns out to
+be CF **gives up `Challenged`** (raw can't solve — reconfigure as solve). And
+**no single challenged exit can affect the host or any other request**: on the
+raw path a challenge flags *that IP*, mara benches it briefly and rotates to a
+clean exit; only when a request's own rotation is exhausted with every tried exit
+challenged does that *one request* give up. Register non-CF traffic (an API POST,
+an image GET) as `raw` so it rides the pool browser-free.
 
 The unit of work is a `Resource` (`url` + optional `method`/`headers`/`body` +
 an optional caller `key` echoed on the result); `From<&str>/<String>/<Url>` give
@@ -72,8 +100,14 @@ decoded to `T` once at the stream edge. `fetch_all`/`fetch_http` decode to
 `String` (UTF-8 lossy — no charset detection); `fetch_all_bytes`/`fetch_bytes`
 hand back raw bytes. Text-vs-bytes is orthogonal to solve-vs-raw routing.
 
-External contract (`cli/src/main.rs`): `fetch <url…>`, `capture <url>`,
-`doctor`. Key `fetch` flags:
+External contract (`cli/src/main.rs`): `fetch <url…>`, `warm <url…>`,
+`capture <url>`, `doctor`. `warm` registers each host as a solve domain and just
+lets the background maintainer warm the catalog (no jobs) — a best-effort
+pre-warm that banks `cf_clearance` per exit into `--data-dir`/`MARA_DATA_DIR` for
+a later `fetch` to replay. It watches the snapshot and stops once the warm count
+*and* total solve count plateau (every reachable exit solved; the rest are
+benched/unreachable — tried, can't clear), floored so early polls don't call it
+done before the first solves land, and capped by `--max-wait`. Key `fetch` flags:
 
 - `-b/--browser-concurrency` — **B**, the live-browser cap (= concurrent solves),
   a machine-load guard (default 4). Clamped down to the catalog size.
@@ -90,13 +124,21 @@ External contract (`cli/src/main.rs`): `fetch <url…>`, `capture <url>`,
   `--max-exit-latency` · `--probe-concurrency` (default 64) · `--loaded` ·
   `--data-dir` (persist) · `--serve` (keep the dashboard alive).
 
+**Chrome never outlives the process.** Every Chrome is launched under
+**`PR_SET_PDEATHSIG(SIGKILL)`** (via a tiny `setpriv` wrapper — see `ChromeExec`
+below), so the *kernel* kills it the instant our process dies, for **any** reason:
+`kill -9`, a panic, or a library consumer that never runs a signal handler. This is
+the load-bearing guarantee — `kill_on_drop` and signal handlers both need our code
+to run, so neither survives SIGKILL. (Requires `setpriv`/util-linux; absent it, we
+launch Chrome directly and warn — the only configuration that can orphan.)
+
 **Interrupt (Ctrl-C / SIGTERM)** is an *abort*, not a graceful drain:
 `Client::abort` drops the worker tasks' `Browser`s (so `kill_on_drop` SIGKILLs
-Chrome) and exits immediately. This is deliberate — a signal skips Rust drops, so
-a plain exit would orphan Chrome, while `shutdown()` would drain the whole batch
-first. Clearances persist on solve, so only in-memory stat deltas are lost.
-`shutdown()` (with `persist_all`) is the normal end-of-run path; a second signal
-hard-exits.
+Chrome) and exits immediately — a fast, tidy interrupt. This is deliberate:
+`shutdown()` would drain the whole batch first. It's an *optimization* over PDEATHSIG,
+not the safety net (a consumer that installs no handler is still covered by PDEATHSIG).
+Clearances persist on solve, so only in-memory stat deltas are lost. `shutdown()`
+(with `persist_all`) is the normal end-of-run path; a second signal hard-exits.
 
 ## Module decomposition
 
@@ -122,7 +164,12 @@ items), not in `tests/` (which sees only the public API).
 - **`crate::solver`** — the browser. `Browser::solve(cfg, url) -> Result<Cleared,
   Reason>`. **Firewall (must hold):** `solver` has zero references to the
   lease/pool/worker/store/client — the browser code cannot see an exit. Its only
-  outward seam is `solver::observe::Observer`.
+  outward seam is `solver::observe::Observer`. Owns Chrome process lifetime:
+  `ChromeExec` resolves the executable once per instance (the `setpriv --pdeathsig`
+  wrapper, or Chrome directly) and its `Drop` removes its own wrapper file on a clean
+  exit — the file is keyed by PID *and* a counter, since one process can hold more
+  than one `ChromeExec` (e.g. two `Client`s) and each must own a file the others
+  can't delete out from under it.
 - **orchestration** — `Client`, the one-worker-per-exit serving pool + background
   maintainer, egress/pool, slim, store, ladder, introspection, doctor, mullvad.
 
@@ -150,16 +197,21 @@ the CAS `Idle→Serving`/`Idle→Solving` is the single coordination point.
 
 - **Serving worker** (bound to exit *X*): waits until *X* is claimable (ready +
   idle + not cooling + under the latency cap) **and**, for a solve workload, warm
-  for **all** solve domains (raw needs no warmth). Only then pulls a `Job`,
-  claims *X*, and serves slim. It **never touches a browser**. This gate is the
-  **tail-latency guarantee**: a cold/warming worker never claims a resource, so
-  warm idle workers finish the stragglers — a slow-to-warm or failing exit can
-  never hostage a request another exit could serve *now*.
+  for every solve domain that can still plausibly warm (raw needs no warmth). A
+  domain whose latest solve redirected to a host that then failed self-verify
+  (above) is excluded from this — otherwise one domain that will never warm
+  would starve every *other* domain sharing the pool, waiting on a readiness
+  that's never coming. Only then pulls a `Job`, claims *X*, and serves slim. It
+  **never touches a browser**. This gate is the **tail-latency guarantee**: a
+  cold/warming worker never claims a resource, so warm idle workers finish the
+  stragglers — a slow-to-warm or failing exit can never hostage a request
+  another exit could serve *now*.
 - **The maintainer** (B tasks): walks the catalog **fastest-first**, solves once
   under a B permit to bank a `(exit, domain)` clearance, and releases the exit
   warm — persistently, keeping the catalog warm as exits free/cool/recover. It
-  warms host-wide clearances keyed by the registered **solve-domain** (so a
-  suffix registration covers subdomains). A warm solve gets a short warm timeout
+  warms clearances keyed by the registered **solve host** (exact match — the same
+  host slim later replays against, navigating the browser to `https://{host}/`).
+  A warm solve gets a short warm timeout
   (≪ `--timeout`) so a stuck exit frees its scarce B slot fast; a headed
   `fetch_browser` gets the full timeout. Empty solve-set → the maintainer idles.
 
@@ -193,29 +245,69 @@ sleep with no shared coordinator.
   or an unwinnable config error.** Any real origin response (2xx, 404, most 4xx)
   is delivered as success. A bot-protection/transport obstacle (rate-limit,
   block, timeout, unreachable, a stale-clearance challenge on a registered host)
-  is mara's job to overcome, so the resource **retries forever** across exits.
-  Give-up is reserved for three unwinnable-by-retry cases:
-  1. a **raw challenge** on every tried exit → an unregistered CF host
-     (`GaveUp(Challenged)` — register it);
+  is mara's job to overcome, so the resource **retries across exits** — a stale
+  cookie re-warms, a bad IP rotates away. A solve-host challenge that slim can
+  never clear **escalates to a headed fetch** (below) rather than looping. An
+  **unconfigured host** is rejected pre-flight (`Unconfigured`, at `submit`, before
+  any exit is leased — it's a caller config error, not something to retry). The
+  remaining give-ups are reserved for four unwinnable cases discovered *while*
+  trying:
+  1. a **challenge on every tried exit for a host configured `raw`** → it's
+     actually CF (`GaveUp(Challenged)` — reconfigure it as solve);
   2. a **broken fingerprint triple** — a solve-host challenge while slim has
-     *never once* served (`FingerprintMismatch`);
-  3. a **persistently dead pool** — when `Resting` (every non-wonky exit cooling)
+     *never once* served (`FingerprintMismatch` — suspect the Chrome↔TLS↔UA pin,
+     not a stray page; mara gives up rather than browser every request);
+  3. a **domain confirmed structurally misconfigured** — a solve-time redirect
+     whose landed-host clearance is independently verified never to validate
+     against the configured host (`MisconfiguredHost`, naming the landed host —
+     register it as its own domain instead);
+  4. a **persistently dead pool** — when `Resting` (every non-wonky exit cooling)
      *and* a resource has made no progress for `lease_timeout` (`Resting`). A
      *transient* resting wave is winnable, so the resource waits. Pacing never
      triggers this reap (a paced exit isn't cooling).
+
+- **Escalation to headed.** Some URLs get a **per-URL** CF challenge that a
+  domain-level `cf_clearance` doesn't satisfy over plain HTTP, even though a real
+  browser clears them. A solve-host slim challenge first **re-warms and retries
+  slim**, bounded by `Job.attempts` — a *transient* challenge clears on the next
+  fresh clearance and never escalates. Only a challenge that survives the *whole*
+  budget is genuinely per-URL-hard: the resource's `Job::Html` then converts to a
+  `Job::Headed` fetch of its *own* URL — settle the page, deliver its HTML into the
+  same result slot — invisible to the caller, just a slower solved fetch. **Retry
+  before escalate is load-bearing:** it keeps escalations rare (only truly
+  unclearable URLs draw a browser), so they can't flood the scarce **B** solve
+  budget the maintainer needs for warming. The settled page is **re-classified**
+  (`classify::from_page`) so a page that *cleared then settled into* a
+  rate-limit/block isn't handed back as a 200 — it's deferred instead. (A
+  content-shaped stub — a valid 200 that's merely body-less — is not an error
+  `classify` can see; that stays the caller's check.) When the budget's spent,
+  escalate only if the fingerprint triple is trustworthy (the Chrome↔TLS pin
+  matched, or slim has served); else give up `FingerprintMismatch` rather than
+  browser every request. A domain already confirmed structurally misconfigured
+  (above) short-circuits all of this — retrying or escalating can't fix a
+  redirect to the wrong host, so it gives up `MisconfiguredHost` immediately
+  regardless of remaining budget (else escalation would "succeed" by browsering
+  every request forever, since a headed fetch doesn't care about host binding
+  the way a slim replay does — silently, since it never fails). So `fetch_all`
+  always terminates. If the headed fetch also can't clear it, that's a genuine
+  `GaveUp`. Routing is the pure `ladder::decide_challenge`.
 
 - **Failure routing.** A winnable exit-quality failure (5xx/timeout/rate-limit/
   block) cools or kills *this* exit and re-queues **without touching
   `Job.attempts`** (retry forever). Because the exit is now cooled/cold, its own
   worker won't re-pull the job, so the retry lands on a *different* exit — one bad
-  IP can't fail a resource. Only a **raw challenge** runs down `Job.attempts`. A
-  **solve-host challenge** drops the stale clearance and benches the exit with an
-  **escalating** cooldown (reset by the next successful serve): this is the
-  key anti-waste rule — a CF-flagged IP the browser can warm but whose slim
-  replay is always challenged climbs to a long bench and drops out of the
-  fastest-first warming rotation, instead of soaking up the B budget being
-  re-warmed on loop. A healthy exit whose cookie occasionally expires challenges
-  rarely and resets its streak → only a brief cool.
+  IP can't fail a resource. A **raw challenge** runs down `Job.attempts`; a
+  **solve-host challenge** runs it down too (bounded, then escalates — above) and
+  always drops the stale clearance and benches the exit with an **escalating**
+  cooldown (reset by the next successful serve of that same host): the key
+  anti-waste rule — a CF-flagged IP the browser can warm but whose slim replay is
+  always challenged climbs to a long bench and drops out of the fastest-first
+  warming rotation, instead of soaking up the B budget being re-warmed on loop. A
+  healthy exit whose cookie occasionally expires challenges rarely and resets its
+  streak → only a brief cool. This streak is keyed **per `(exit, host)`**, not
+  exit-wide — a healthy second domain sharing the exit can't reset a different,
+  still-broken domain's streak (and so can't mask it into looking briefly cooled
+  when it's actually persistent).
 
 - **Wakes are per-exit.** Each exit has one interested worker, so a disposition
   change (a banked clearance, a lapsed cooldown, a re-confirming probe) fires just
@@ -229,10 +321,18 @@ sleep with no shared coordinator.
 **Hermetic coverage.** The warming **solve** and the **slim** request are seams
 (`SolveFn`/`SlimFn`, `None` in production). Tests inject fakes and drive the real
 workers + maintainer with no browser or HTTP, proving: the catalog warms and
-serves, multi-domain independence, a raw host never solves, one challenged exit
-can't block the scrape, the tail-latency guarantee, per-IP spacing, and that the
-three give-ups above are the *only* failures. Only real CF/Mullvad behaviour is
-left to the live tests.
+serves, multi-domain independence, a raw host never solves, an unconfigured host
+is rejected `Unconfigured` before any work while a configured-raw-but-CF host
+gives up `Challenged`, one challenged exit can't block the scrape, the
+tail-latency guarantee, per-IP spacing, and that the give-ups above are the
+*only* slim-terminal failures — including that a harmless solve-time redirect
+still banks and serves, and that a domain confirmed structurally misconfigured
+backs off warming, gives up fast (`MisconfiguredHost`), and never starves a
+healthy domain sharing the same pool. The solve-host-challenge
+routing (retry vs escalate vs give up) is pinned by `ladder::decide_challenge`
+unit tests; the headed **escalation** itself — like `fetch_browser`, whose
+`Job::Headed` path it reuses — needs a real browser, so it's a live-test concern.
+Only real CF/Mullvad behaviour is left to the live tests.
 
 **Diagnostics.** Tracing is a flat, greppable log dump keyed by exit (`code=`)
 and resource (`req=`); the link from a stalled serving request to the maintainer
@@ -241,7 +341,11 @@ crate's level; `RUST_LOG` overrides. On a solve give-up, `solver::diagnose` save
 a screenshot, framebuffer, DOM, widget probe, and summary under
 `<artifacts>/fail-<id>`, and hands the last frame + summary to the
 `Observer::failed` ghost seam — so a failed browser is inspectable from the
-dashboard and traceable to its give-up line by `code=`.
+dashboard and traceable to its give-up line by `code=`. A solve-time redirect
+logs a `WARN` immediately (worth knowing about even if it turns out harmless);
+a *confirmed* structural mismatch escalates to `ERROR` and surfaces in
+`fetch`/`warm`'s own end-of-run summary (`Client::misconfigured_domains`), so
+registering the landed host doesn't require `-v debug` to discover.
 
 ## Egress, the pool, and the unified `Exit`
 
@@ -267,9 +371,11 @@ single leasing worker:
   through **one** writer (`observe_probe`), so a latency refresh can never split
   from the health transition it implies. While leased, a re-probe refreshes *only*
   latency; on an idle exit a reachable probe confirms `Ready`. Re-probe cadence is
-  health-aware (unconfirmed `Probing` retries fast; settled exits re-confirm
-  slowly). Enough consecutive failures demote `Probing → Wonky`; a later reachable
-  probe recovers it.
+  health-aware (unconfirmed `Probing` retries fast; a settled exit re-confirms
+  slowly, and a persistently-`Wonky` one backs off further with each consecutive
+  failure so a dead relay goes quiet rather than re-probing every minute forever —
+  at the cost of a slower comeback if it recovers). Enough consecutive failures
+  demote `Probing → Wonky`; a later reachable probe recovers it.
 - **activity** — `Idle | Serving | Solving`. `Idle` = free to lease; the others
   mean held by a worker.
 - **warmth + cooldown + pacing** (all in `store::ExitData`) — per-`(exit, host)`
@@ -285,9 +391,14 @@ clearance, ignoring cooling) is distinct from warm-*now* (also excludes cooling)
 
 ## Persistence & the fingerprint triple (`api::store`)
 
-`store` persists per-exit clearances + stats, keyed by proxy URL, under
+`store` persists per-exit **clearances only**, keyed by proxy URL, under
 `--data-dir` (ephemeral otherwise). Clearances persist **only on solve** and are
-seeded on load; everything else is in-memory.
+seeded on load; everything else — including all `Stats` counters — is in-memory
+and **per-run**. Stats are deliberately not persisted: each run starts its
+counters from zero so the dashboard reflects *this* run, not a lifetime total
+accreted across every past scrape (and nothing reads them for decisions — they're
+telemetry). A legacy `state.json` with a `stats` key still loads (the field is
+ignored) and sheds it on the next save.
 
 **Fingerprint-triple invariant:** a handed-down clearance is only accepted by CF
 if the *installed Chrome major* ↔ the *pinned slim TLS profile* ↔ the *replayed
@@ -328,12 +439,20 @@ The dashboard projects an exit's three facets to one badge by a single priority
 (`BADGE_ORDER`, also the census + sort order): activity first, then every reason
 it can't be leased, then the two leasable states —
 `solving > serving > rate-limited/blocked/cooldown > wonky > slow > probing >
-paced > warm > cold`. The ordering is **honest about leasability**: `warm`/`cold`
+paced > idle > cold`. The ordering is **honest about leasability**: `idle`/`cold`
 mean "servable *right now*", so a cleared-but-still-`probing` exit reads `probing`,
-and `paced` (warm + healthy but spacing) sits just above `warm`. The header's
-**`cleared`** count is the orthogonal warm-store size (every exit holding a usable
-clearance, servable now or not); it can't be a census pill or it would
-double-count and break the sums-to-total invariant.
+and `paced` (warm + healthy but spacing) sits just above `idle`. The two
+leasable states are **split by warmth on purpose** — `idle` (warm, free, nothing to
+do — a mid-run lull *or* the end-of-run drain; the exit can't tell "waiting for
+work" from "no more work", only the job-progress strip knows) vs `cold` (not warmed
+yet, *wants* work but must be solved first). Lumping cold into "idle" misread as "N
+exits wasted" when most were just mid-ramp; `cold` is rendered neutral-grey, `idle`
+green. The split is gated on the `solving` flag (any solve domain registered): on a
+**pure-raw** workload warming doesn't apply, so an un-warm leasable exit is just
+`idle`, never `cold`. The header's **`cleared`** count is
+the orthogonal warm-store size (every exit holding a usable clearance, servable now
+or not); it can't be a census pill or it would double-count and break the
+sums-to-total invariant.
 
 **Warmth-display boundary.** Warmth is per-`(exit, domain)` — routing keys on that,
 so routing is always correct. The per-exit `warm` badge (warm-for-≥1 host) is a

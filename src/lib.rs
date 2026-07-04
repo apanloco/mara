@@ -4,17 +4,23 @@
 //! Today that means Cloudflare: mara solves the interactive challenge in a real headed browser
 //! **once** to bank a `cf_clearance` cookie, then serves every subsequent request to that host
 //! **browser-free** — a plain HTTP client replaying the cookie and user-agent. The browser is the
-//! fallback; the slim replay is the hot path. Hosts you don't register are fetched raw over the
-//! same rotating pool, never touching a browser.
+//! fallback; the slim replay is the hot path. Routing is fully explicit: every host you fetch must
+//! be registered (exact match) as either a solve host (Cloudflare) or a raw one (fetched over the
+//! same rotating pool, never touching a browser). An unregistered host fails fast — mara never
+//! silently guesses a route.
 //!
 //! # Quick start
 //!
 //! ```no_run
 //! use futures::StreamExt;
-//! use mara::{Client, Config};
+//! use mara::{Client, Config, Domain};
 //!
 //! # async fn run() -> anyhow::Result<()> {
-//! let client = Client::new(Config::default()).await?;
+//! let client = Client::new(Config {
+//!     domains: vec![Domain::solve("example.com")],
+//!     ..Default::default()
+//! })
+//! .await?;
 //!
 //! // One result per input URL, in completion order. Bare URL strings work directly.
 //! let mut results = client.fetch_all(["https://example.com/a", "https://example.com/b"]);
